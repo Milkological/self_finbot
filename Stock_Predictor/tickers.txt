@@ -1,0 +1,42 @@
+# FinBot — Watchlist / Batch-Run File
+# ============================================================
+# Usage:
+#   python main.py --file tickers.txt
+#   python main.py --file tickers.txt --no-llm
+#   python main.py --file tickers.txt --no-llm --retrain
+#
+# Format rules:
+#   • One Yahoo Finance ticker symbol per line (case-insensitive).
+#   • Lines beginning with '#' are treated as comments and ignored.
+#   • Blank lines are silently skipped.
+#   • If a ticker fails (e.g. invalid symbol or network error), the
+#     run logs the error and continues to the next ticker.
+#   • International tickers use Yahoo Finance notation (e.g. 9988.HK,
+#     005930.KS, NESN.SW).
+# ============================================================
+
+# --- Large-cap US Technology ---
+# AAPL
+# MSFT
+# GOOGL
+# NVDA
+# META
+
+# --- Consumer / E-commerce ---
+# AMZN
+# TSLA
+
+# Self Own Stock 
+QUBT
+NOW
+ILMN
+
+
+# --- Broad-market ETFs ---
+# Useful for a quick sanity-check — the rule-based judge handles
+# tickers without EPS gracefully (N/A fields are not penalised).
+# SPY
+# QQQ
+
+# --- Example: International ticker ---
+# 9988.HK

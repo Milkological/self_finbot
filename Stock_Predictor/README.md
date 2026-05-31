@@ -25,7 +25,8 @@ FinBot is a command-line stock analysis tool that combines classic quantitative 
 8. [Output Files](#output-files)
 9. [ML Model Accuracy](#ml-model-accuracy)
 10. [Understanding Verdict Divergence](#understanding-verdict-divergence)
-11. [Disclaimer](#disclaimer)
+11. [Feedback Loop & Historical Accuracy](#feedback-loop--historical-accuracy)
+12. [Disclaimer](#disclaimer)
 
 ---
 
@@ -40,6 +41,15 @@ python main.py --ticker MSFT --no-llm
 
 # Force ML model retraining
 python main.py --ticker TSLA --retrain
+
+# Run a batch of tickers from a watchlist file
+python main.py --file tickers.txt
+python main.py --file tickers.txt --no-llm
+
+# Resolve pending prediction outcomes (fetch actual prices for expired horizons)
+python main.py --resolve
+python main.py --ticker AAPL --resolve   # resolve one ticker only
+python main.py --file tickers.txt --resolve  # resolve all tickers in file
 ```
 
 Results are printed to the terminal and saved under `reports/{TICKER}_{DATE}/`:
@@ -66,7 +76,7 @@ Core dependencies:
 | `scikit-learn` | Gradient Boosting ML models |
 | `matplotlib` | Chart generation |
 | `rich` | Colour terminal output |
-| `openai` | Azure OpenAI API client |
+| `openai` | Azure OpenAI and DeepSeek API client (OpenAI-compatible) |
 | `google-genai` | Google Gemini API client |
 | `reportlab` | PDF generation |
 | `json-repair` | Robust parsing of LLM JSON output |
@@ -88,6 +98,9 @@ AZURE_OPENAI_API_VERSION=2024-02-01
 GOOGLE_API_KEY=your_google_api_key
 GOOGLE_MODEL=gemini-2.0-flash
 
+DEEPSEEK_API_KEY=your_deepseek_api_key
+DEEPSEEK_MODEL=deepseek-chat          # optional, default: deepseek-chat
+
 # ── Financial constants ──────────────────────────────────────────────
 RISK_FREE_RATE=0.0525
 EQUITY_RISK_PREMIUM=0.055
@@ -97,9 +110,10 @@ MAX_RISK_PER_TRADE=0.01
 LLM_TEMPERATURE=0.2
 LLM_MAX_TOKENS_AZURE=4000
 LLM_MAX_TOKENS_GOOGLE=3000
+LLM_MAX_TOKENS_DEEPSEEK=4000
 ```
 
-If both Azure and Google are configured, both providers run independently and their outputs are displayed side by side.
+If multiple providers are configured, all run independently and their outputs are combined. Each active provider appears in the terminal display and Markdown report. Any provider whose API key is absent is silently skipped — no errors are raised.
 
 ---
 
@@ -594,6 +608,12 @@ Each run saves to `reports/{TICKER}_{YYYY-MM-DD}/`:
 | `report.pdf` | PDF version |
 | `features.csv` | Feature matrix used for ML training |
 
+The feedback loop additionally writes/updates:
+
+| File | Contents |
+|---|---|
+| `feedback/{TICKER}_feedback.csv` | Per-ticker prediction log — one row per provider per run, outcomes filled in over time as horizons pass |
+
 ---
 
 ## ML Model Accuracy
@@ -641,6 +661,48 @@ LLMs are trained on financial text that skews bullish (analyst reports rarely ca
 | LLM BUY (LOW confidence) + rule-based SELL | The LLM is uncertain itself. Treat as hold or avoid. |
 
 A large gap between the two verdicts is a direct measure of **how much of the bull case depends on things that cannot be verified from current financial data**.
+
+---
+
+## Feedback Loop & Historical Accuracy
+
+FinBot tracks every prediction it makes and auto-resolves outcomes once each forecast horizon has elapsed.
+
+### How It Works
+
+1. **Prediction logging** — after each full pipeline run, a row is appended to `feedback/{TICKER}_feedback.csv` capturing the ticker, date, mode, current price, all LLM/rule-based price targets, ML signals, analyst data, volume, options metrics (put/call ratio, average IV), short interest, and all headline context.
+
+2. **Outcome resolution** (`--resolve` flag) — fetches the actual closing price for each expired horizon (1W, 2W, 3W, 1M, 3M, 6M, 9M, 12M) and fills in `actual_price`, `pct_error`, and `dir_correct` (1 if the direction was correct, 0 otherwise).
+
+3. **Bias correction** — once N ≥ 5 resolved rows exist for a horizon, a `correction_factor` is computed:
+   ```
+   correction_factor = 1 + clamp(mean_bias, -0.20, +0.20)
+   ```
+   This multiplier is applied to LLM price targets before display and in the Markdown report.
+
+4. **Dynamic lens weights** (rule-based mode) — each lens's (fundamental/technical/valuation/risk) contribution is scaled based on how accurate it has been relative to a 50% baseline, then renormalised. Capped at ±50% of the original weight. Activates at N ≥ 5 resolved rows.
+
+5. **LLM prompt injection** — the Judge agent receives a `[HISTORICAL ACCURACY FOR {TICKER}]` block summarising per-horizon direction accuracy, mean bias, and recommendation hit rate.
+
+### Horizon → Calendar Days
+
+| Code | Calendar days |
+|------|--------------|
+| 1W   | 7            |
+| 2W   | 14           |
+| 3W   | 21           |
+| 1M   | 31           |
+| 3M   | 93           |
+| 6M   | 186          |
+| 9M   | 279          |
+| 12M  | 365          |
+
+### Configuration
+
+| Env variable | Default | Description |
+|---|---|---|
+| `FEEDBACK_MIN_SAMPLES` | `5` | Minimum resolved rows before corrections/weight adjustments activate |
+| `FEEDBACK_MAX_BIAS_CORRECTION` | `0.20` | Maximum bias correction clamped to ±20% |
 
 ---
 

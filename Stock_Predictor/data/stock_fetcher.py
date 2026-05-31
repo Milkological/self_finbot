@@ -121,3 +121,48 @@ def fetch_stock_data(ticker: str) -> tuple[pd.DataFrame, dict]:
         info["currentPrice"] = info["regularMarketPrice"]
 
     return price_df, info
+
+
+def fetch_options_data(ticker: str) -> dict:
+    """
+    Fetch near-term options data for *ticker* via yfinance.
+
+    Returns a dict with:
+        put_call_ratio : float | None  — total put volume / total call volume
+                         on the nearest available expiry.
+                         >1 = net bearish flow, <1 = net bullish flow.
+        options_iv_avg : float | None  — average implied volatility across
+                         all near-term option contracts (calls + puts).
+
+    Returns empty values on any error (e.g. ETFs with no options chain).
+    """
+    result = {"put_call_ratio": None, "options_iv_avg": None}
+    try:
+        stock = yf.Ticker(ticker)
+        expirations = stock.options
+        if not expirations:
+            return result
+
+        # Use the nearest expiry with available data
+        chain = stock.option_chain(expirations[0])
+        calls = chain.calls
+        puts  = chain.puts
+
+        # Put/Call ratio by volume
+        call_vol = calls["volume"].fillna(0).sum()
+        put_vol  = puts["volume"].fillna(0).sum()
+        if call_vol > 0:
+            result["put_call_ratio"] = round(float(put_vol / call_vol), 3)
+
+        # Average implied volatility across both sides
+        iv_values = pd.concat([
+            calls["impliedVolatility"].dropna(),
+            puts["impliedVolatility"].dropna(),
+        ])
+        if len(iv_values) > 0:
+            result["options_iv_avg"] = round(float(iv_values.mean()), 4)
+
+    except Exception:
+        pass  # Graceful degradation — options data is supplementary
+
+    return result

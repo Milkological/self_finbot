@@ -64,7 +64,7 @@ import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from json_repair import repair_json
-from openai import AzureOpenAI
+from openai import AzureOpenAI, OpenAI
 from google import genai
 from google.genai import types as genai_types
 
@@ -77,10 +77,15 @@ from config import (
     GOOGLE_API_KEY,
     GOOGLE_MODEL,
     GOOGLE_ENABLED,
+    DEEPSEEK_API_KEY,
+    DEEPSEEK_MODEL,
+    DEEPSEEK_BASE_URL,
+    DEEPSEEK_ENABLED,
     LLM_ENABLED,
     LLM_TEMPERATURE,
     LLM_MAX_TOKENS_AZURE,
     LLM_MAX_TOKENS_GOOGLE,
+    LLM_MAX_TOKENS_DEEPSEEK,
 )
 
 # ReAct system instruction injected into every agent call
@@ -916,6 +921,7 @@ def _build_judge_prompt(
     market_risk: dict,
     portfolio_risk: dict,
     ml_result=None,
+    accuracy_context: dict = None,
 ) -> str:
     price    = info.get("currentPrice", "N/A")
     company  = info.get("shortName", ticker)
@@ -1111,7 +1117,22 @@ def _build_judge_prompt(
         '"timing_note":"<1-2 sentences: should the user enter now, wait for a specific price, or avoid until a condition changes?>","'
         'team_summaries":{"analyst_team":"<2 sentences summarising A1-A4 findings>","researcher_team":"<2 sentences: bull vs bear balance and net bias>","trading_team":"<2 sentences: what the 3 traders collectively recommend and why>","risk_team":"<1 sentence: overall risk posture and recommended size>"},'
         '"news_with_dates":[{"title":"<headline>","publisher":"<publisher>","date":"<YYYY-MM-DD>","impact":"BULLISH"|"BEARISH"|"NEUTRAL","impact_note":"<10 words on why this news matters>"}]}'
-    )
+    ) + (_get_accuracy_injection(ticker, accuracy_context))
+
+
+# ================================================================== #
+# Feedback accuracy injection helper
+# ================================================================== #
+
+def _get_accuracy_injection(ticker: str, accuracy_context: dict | None) -> str:
+    """Return formatted historical accuracy block for the Judge prompt, or empty string."""
+    if not accuracy_context or not accuracy_context.get("has_data"):
+        return ""
+    try:
+        from feedback.accuracy import format_llm_injection
+        return "\n\n" + format_llm_injection(ticker, accuracy_context)
+    except Exception:
+        return ""
 
 
 # ================================================================== #
@@ -1313,7 +1334,7 @@ def _error_result(msg: str) -> dict:
 
 def _run_agent_chain(
     call_fn, ticker, info, technical, fundamental, statistical, analyst_data,
-    ml_result=None,
+    ml_result=None, accuracy_context=None,
 ) -> dict:
     """
     Run the full 13-agent chain using a single provider's call function.
@@ -1415,6 +1436,7 @@ def _run_agent_chain(
             bullish_researcher, bearish_researcher, synthesizer,
             momentum_trader, value_trader, swing_trader,
             market_risk, portfolio_risk, ml_result,
+            accuracy_context=accuracy_context,
         ))
     except Exception as e:
         judge = _error_result(f"Judge error: {e}")
@@ -1473,6 +1495,8 @@ def _extract_json(raw: str) -> dict:
     Handles ReAct preamble (THOUGHT/ACTION/OBSERVATION/ANSWER sections).
     """
     text = raw.strip()
+    if not text:
+        raise json.JSONDecodeError("Empty response from LLM", "", 0)
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text.rstrip())
@@ -1563,6 +1587,58 @@ def _call_google(prompt: str) -> dict:
 
 
 # ================================================================== #
+# DeepSeek call (OpenAI-compatible)
+# ================================================================== #
+
+def _call_deepseek(prompt: str) -> dict:
+    client = OpenAI(
+        api_key  = DEEPSEEK_API_KEY,
+        base_url = DEEPSEEK_BASE_URL,
+    )
+    response = client.chat.completions.create(
+        model      = DEEPSEEK_MODEL,
+        messages   = [
+            {"role": "system", "content": _REACT_SYSTEM},
+            {"role": "user",   "content": prompt},
+        ],
+        temperature = LLM_TEMPERATURE,
+        max_tokens  = LLM_MAX_TOKENS_DEEPSEEK,
+    )
+    choice   = response.choices[0]
+    raw_text = (choice.message.content or "").strip()
+    finish   = getattr(choice, "finish_reason", None)
+
+    if finish == "length" and not raw_text:
+        raise ValueError(
+            f"DeepSeek hit the token limit (max_tokens={LLM_MAX_TOKENS_DEEPSEEK}) "
+            "before producing any JSON. Increase LLM_MAX_TOKENS_DEEPSEEK in .env."
+        )
+    if not raw_text:
+        raise ValueError(
+            "DeepSeek returned an empty response. "
+            f"finish_reason={finish!r}. Check your API key and model name."
+        )
+    if finish == "length":
+        # Truncated mid-JSON — try to repair before giving up
+        import warnings
+        warnings.warn(
+            f"DeepSeek response was truncated (finish_reason='length'). "
+            "Consider raising LLM_MAX_TOKENS_DEEPSEEK."
+        )
+
+    result = _extract_json(raw_text)
+    result["llm_available"] = True
+    result["_provider"]     = f"DeepSeek ({DEEPSEEK_MODEL})"
+    usage = response.usage
+    result["_token_usage"] = {
+        "prompt":     usage.prompt_tokens if usage else 0,
+        "completion": usage.completion_tokens if usage else 0,
+        "total":      usage.total_tokens if usage else 0,
+    }
+    return result
+
+
+# ================================================================== #
 # Public entry point
 # ================================================================== #
 
@@ -1574,13 +1650,28 @@ def get_llm_analysis(
     statistical:  dict,
     analyst_data: dict,
     ml_result:    dict = None,
+    accuracy_context: dict = None,
+    accuracy_context_map: dict = None,
 ) -> dict:
     """
     Run the full 5-team, 13-agent LLM analysis pipeline for *ticker*.
 
     Returns a result dict consumed by terminal_display and report_generator.
     Falls back gracefully when no LLM credentials are configured.
+
+    Parameters
+    ----------
+    accuracy_context_map : dict, optional
+        Maps provider name → accuracy_context dict so each chain gets its own
+        historical accuracy for bias correction and prompt injection.
+        Falls back to the single ``accuracy_context`` when not provided.
     """
+    # Helper: select per-provider context or fall back to the shared one
+    def _ctx(provider_name: str) -> dict | None:
+        if accuracy_context_map and provider_name in accuracy_context_map:
+            return accuracy_context_map[provider_name]
+        return accuracy_context
+
     description = build_company_description(info, analyst_data)
 
     if not LLM_ENABLED:
@@ -1623,6 +1714,7 @@ def get_llm_analysis(
             azure_chain = _run_agent_chain(
                 _call_azure, ticker, info, technical, fundamental,
                 statistical, analyst_data, ml_result,
+                accuracy_context=_ctx("Azure OpenAI"),
             )
             azure_chain["llm_available"] = True
             azure_chain["_provider"]     = "Azure OpenAI"
@@ -1637,6 +1729,7 @@ def get_llm_analysis(
             google_chain = _run_agent_chain(
                 _call_google, ticker, info, technical, fundamental,
                 statistical, analyst_data, ml_result,
+                accuracy_context=_ctx(f"Google Gemini ({GOOGLE_MODEL})"),
             )
             google_chain["llm_available"] = True
             google_chain["_provider"]     = f"Google Gemini ({GOOGLE_MODEL})"
@@ -1646,6 +1739,24 @@ def get_llm_analysis(
         except Exception as e:
             providers_result[f"Google Gemini ({GOOGLE_MODEL})"] = _error_result(
                 f"Google Gemini error: {e}"
+            )
+
+    # -- DeepSeek ----------------------------------------------
+    if DEEPSEEK_ENABLED:
+        try:
+            deepseek_chain = _run_agent_chain(
+                _call_deepseek, ticker, info, technical, fundamental,
+                statistical, analyst_data, ml_result,
+                accuracy_context=_ctx(f"DeepSeek ({DEEPSEEK_MODEL})"),
+            )
+            deepseek_chain["llm_available"] = True
+            deepseek_chain["_provider"]     = f"DeepSeek ({DEEPSEEK_MODEL})"
+            providers_result[f"DeepSeek ({DEEPSEEK_MODEL})"] = deepseek_chain
+            if primary_result is None:
+                primary_result = deepseek_chain
+        except Exception as e:
+            providers_result[f"DeepSeek ({DEEPSEEK_MODEL})"] = _error_result(
+                f"DeepSeek error: {e}"
             )
 
     if primary_result is None:
@@ -1659,4 +1770,19 @@ def get_llm_analysis(
     primary_result["llm_available"] = True
     primary_result["providers"]     = providers_result
     primary_result["description"]   = description
+
+    # Apply per-provider bias correction to each provider's target prices
+    try:
+        from feedback.accuracy import apply_bias_correction
+        for pname, presult in providers_result.items():
+            if presult.get("recommendation") == "ERROR":
+                continue
+            pctx = _ctx(pname) or {}
+            if pctx.get("has_data"):
+                presult["target_prices"] = apply_bias_correction(
+                    presult.get("target_prices", {}), pctx
+                )
+    except Exception:
+        pass
+
     return primary_result

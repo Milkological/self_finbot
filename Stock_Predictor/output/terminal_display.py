@@ -1265,6 +1265,59 @@ def display_ml_predictions(ml_result: dict) -> None:
 
 # ------------------------------------------------------------------ #
 
+def display_historical_accuracy(accuracy_context: dict) -> None:
+    """Render a Rich panel showing feedback-loop historical accuracy stats."""
+    from rich.table import Table
+    from rich.panel import Panel
+
+    table = Table(show_header=True, header_style="bold cyan", box=None, padding=(0, 1))
+    table.add_column("Horizon",    style="bold")
+    table.add_column("N",          justify="right")
+    table.add_column("Dir Acc %",  justify="right")
+    table.add_column("Mean Bias",  justify="right")
+    table.add_column("Correction", justify="center")
+
+    horizon_stats = accuracy_context.get("horizon_stats", {})
+    for h, stats in horizon_stats.items():
+        n   = stats.get("n", 0)
+        acc = stats.get("dir_accuracy")
+        bias = stats.get("mean_bias")
+        cf   = stats.get("correction_factor", 1.0)
+        acc_str  = f"{acc*100:.0f}%" if isinstance(acc, float) else "—"
+        bias_str = f"{bias:+.2%}" if isinstance(bias, float) else "—"
+        corr_str = f"{cf:.3f}" if abs((cf or 1.0) - 1.0) > 0.001 else "—"
+        table.add_row(h.upper(), str(n), acc_str, bias_str, corr_str)
+
+    # ML accuracy
+    ml_acc = accuracy_context.get("ml_accuracy", {})
+    for k, v in ml_acc.items():
+        if isinstance(v, float):
+            table.add_row(f"ML {k}", "—", f"{v*100:.0f}%", "—", "—")
+
+    # Rec hit rate
+    rhr = accuracy_context.get("rec_hit_rate")
+    if isinstance(rhr, float):
+        table.add_row("Rec Hit Rate", "—", f"{rhr*100:.0f}%", "—", "—")
+
+    # Effective weights
+    lines = []
+    if accuracy_context.get("weights_adjusted"):
+        aw = accuracy_context.get("adjusted_weights", {})
+        lines.append(
+            "[dim]Weights adjusted:[/dim]  "
+            + "  ".join(f"{k.title()} {v:.0%}" for k, v in aw.items())
+        )
+
+    total = accuracy_context.get("total_resolved", 0)
+    title = f"HISTORICAL ACCURACY  ({total} resolved prediction(s))"
+    body  = table
+    console.print(Panel(body, title=title, border_style="yellow", padding=(1, 2)))
+    for line in lines:
+        console.print(f"  {line}")
+    if lines:
+        console.print()
+
+
 def display_full_report(
     ticker: str,
     info: dict,
@@ -1275,6 +1328,7 @@ def display_full_report(
     llm: dict,
     ml_result: dict | None = None,
     report_path: str = None,
+    accuracy_context: dict = None,
 ) -> None:
     """
     Print the complete FinBot analysis report to the terminal.
@@ -1289,6 +1343,19 @@ def display_full_report(
     """
     display_header(ticker, info)
     display_basic_description(llm, info)
+
+    # ── Active LLM providers ────────────────────────────────────── #
+    active_providers = [
+        p for p, r in llm.get("providers", {}).items()
+        if r.get("recommendation") != "ERROR"
+    ]
+    if active_providers:
+        provider_str = "  [bold]Analysis providers:[/bold] " + "  ·  ".join(
+            f"[cyan]{p}[/cyan]" for p in active_providers
+        )
+        console.print(provider_str)
+        console.print()
+
     display_technical(technical)
     display_fundamental(fundamental)
     display_statistical(statistical)
@@ -1297,6 +1364,9 @@ def display_full_report(
 
     if ml_result:
         display_ml_predictions(ml_result)
+
+    if accuracy_context and accuracy_context.get("has_data"):
+        display_historical_accuracy(accuracy_context)
 
     if report_path:
         console.print(Rule())

@@ -696,6 +696,7 @@ def run_rule_based_judge(
     statistical:  dict,
     analyst_data: dict,
     ml_result:    dict = None,
+    accuracy_context: dict = None,
 ) -> dict:
     """
     Run the four-lens deterministic judge and return a full result dict.
@@ -709,11 +710,28 @@ def run_rule_based_judge(
     risk = _score_risk(statistical, analyst_data, info)
 
     # ── Base composite (weighted) ────────────────────────────── #
+    # Use dynamically adjusted weights from feedback loop if available
+    _BASE_W = {"fundamental": 0.30, "technical": 0.25, "valuation": 0.30, "risk": 0.15}
+    if (
+        accuracy_context
+        and accuracy_context.get("weights_adjusted")
+        and accuracy_context.get("adjusted_weights")
+    ):
+        w = accuracy_context["adjusted_weights"]
+        w_fund = w.get("fundamental", _BASE_W["fundamental"])
+        w_tech = w.get("technical",   _BASE_W["technical"])
+        w_val  = w.get("valuation",   _BASE_W["valuation"])
+        w_risk = w.get("risk",        _BASE_W["risk"])
+    else:
+        w_fund, w_tech, w_val, w_risk = (
+            _BASE_W["fundamental"], _BASE_W["technical"],
+            _BASE_W["valuation"],   _BASE_W["risk"],
+        )
     composite = (
-        0.30 * fund["score"] +
-        0.25 * tech["score"] +
-        0.30 * val["score"]  +
-        0.15 * risk["score"]
+        w_fund * fund["score"] +
+        w_tech * tech["score"] +
+        w_val  * val["score"]  +
+        w_risk * risk["score"]
     )
 
     # ── ML score modifier (bounded ±10 pts) ──────────────────── #
@@ -746,16 +764,18 @@ def run_rule_based_judge(
                 val["score"] = max(0.0, val["score"] - 3)
             # Recompute composite with nudged val score
             composite = (
-                0.30 * fund["score"] +
-                0.25 * tech["score"] +
-                0.30 * val["score"]  +
-                0.15 * risk["score"]
+                w_fund * fund["score"] +
+                w_tech * tech["score"] +
+                w_val  * val["score"]  +
+                w_risk * risk["score"]
             )
             if ml_result and ml_note:
                 # Re-apply ML adjust
                 avg_prob  = (ml_result.get("clf_5d_prob_up", 0.5) + ml_result.get("clf_21d_prob_up", 0.5)) / 2
                 ml_adjust = max(-10.0, min(10.0, (avg_prob - 0.5) * 20))
                 composite += ml_adjust
+
+    effective_weights = {"fundamental": w_fund, "technical": w_tech, "valuation": w_val, "risk": w_risk}
 
     composite = round(composite, 1)
 
@@ -839,6 +859,7 @@ def run_rule_based_judge(
         "technical_verdict":   tech["summary"],
         "valuation_verdict":   val["summary"],
         "risk_verdict":        risk["summary"],
+        "effective_weights":   effective_weights,
     }
 
 
@@ -871,6 +892,7 @@ def run_rule_based_analysis(
     statistical:  dict,
     analyst_data: dict,
     ml_result:    dict = None,
+    accuracy_context: dict = None,
 ) -> dict:
     """
     Run the rule-based judge and return a dict whose shape matches
@@ -881,7 +903,7 @@ def run_rule_based_analysis(
     from analysis.llm_analysis import build_company_description
 
     description = build_company_description(info, analyst_data)
-    rbj = run_rule_based_judge(info, technical, fundamental, statistical, analyst_data, ml_result)
+    rbj = run_rule_based_judge(info, technical, fundamental, statistical, analyst_data, ml_result, accuracy_context=accuracy_context)
 
     # ── Map composite score to top-level fields ───────────────────── #
     rec  = rbj.get("recommendation", "HOLD")

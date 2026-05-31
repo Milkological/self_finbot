@@ -34,9 +34,19 @@ GOOGLE_MODEL: str = os.getenv("GOOGLE_MODEL", "gemini-2.0-flash")
 GOOGLE_ENABLED: bool = bool(GOOGLE_API_KEY)
 
 # ------------------------------------------------------------------
+# DeepSeek
+# ------------------------------------------------------------------
+DEEPSEEK_API_KEY:  str = os.getenv("DEEPSEEK_API_KEY",  "")
+DEEPSEEK_MODEL:    str = os.getenv("DEEPSEEK_MODEL",    "deepseek-chat")
+DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+
+# True when a DeepSeek API key is present.
+DEEPSEEK_ENABLED: bool = bool(DEEPSEEK_API_KEY)
+
+# ------------------------------------------------------------------
 # LLM gate — True when at least one LLM provider is configured.
 # ------------------------------------------------------------------
-LLM_ENABLED: bool = AZURE_ENABLED or GOOGLE_ENABLED
+LLM_ENABLED: bool = AZURE_ENABLED or GOOGLE_ENABLED or DEEPSEEK_ENABLED
 
 # ------------------------------------------------------------------
 # Financial constants
@@ -94,9 +104,24 @@ CHART_DPI: int = 150               # PNG resolution for saved charts
 # ------------------------------------------------------------------
 # LLM tuning parameters (overridable via .env)
 # ------------------------------------------------------------------
-LLM_TEMPERATURE: float     = float(os.getenv("LLM_TEMPERATURE",      "0.0"))
-LLM_MAX_TOKENS_AZURE: int  = int(os.getenv("LLM_MAX_TOKENS_AZURE",  "8000"))
-LLM_MAX_TOKENS_GOOGLE: int = int(os.getenv("LLM_MAX_TOKENS_GOOGLE", "8192"))
+LLM_TEMPERATURE: float       = float(os.getenv("LLM_TEMPERATURE",         "0.0"))
+LLM_MAX_TOKENS_AZURE: int    = int(os.getenv("LLM_MAX_TOKENS_AZURE",      "8000"))
+LLM_MAX_TOKENS_GOOGLE: int   = int(os.getenv("LLM_MAX_TOKENS_GOOGLE",     "8192"))
+LLM_MAX_TOKENS_DEEPSEEK: int = int(os.getenv("LLM_MAX_TOKENS_DEEPSEEK",   "8000"))
+
+# ------------------------------------------------------------------
+# Feedback loop settings
+# ------------------------------------------------------------------
+# Directory where per-ticker feedback CSV files are stored.
+FEEDBACK_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback")
+
+# Minimum number of resolved predictions needed before bias correction
+# and dynamic weight adjustment are activated.
+FEEDBACK_MIN_SAMPLES: int = int(os.getenv("FEEDBACK_MIN_SAMPLES", "5"))
+
+# Maximum absolute bias correction applied to LLM price targets (as a fraction).
+# 0.20 = ±20% cap. Prevents overcorrection on small samples.
+FEEDBACK_MAX_BIAS_CORRECTION: float = float(os.getenv("FEEDBACK_MAX_BIAS_CORRECTION", "0.20"))
 
 # ------------------------------------------------------------------
 # ML pipeline settings

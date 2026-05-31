@@ -19,6 +19,7 @@ Orchestrates the full pipeline:
 """
 
 import argparse
+import os
 import sys
 import time
 
@@ -26,7 +27,7 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 
 # ---- Internal modules ---- #
-from data.stock_fetcher    import fetch_stock_data
+from data.stock_fetcher    import fetch_stock_data, fetch_options_data
 from data.analyst_fetcher  import fetch_analyst_data
 from analysis.technical    import compute_all_technicals
 from analysis.fundamental  import compute_all_fundamentals
@@ -36,11 +37,14 @@ from analysis.rule_based_judge import run_rule_based_judge, run_rule_based_analy
 from output.terminal_display import display_full_report
 from output.report_generator import create_report_dir, generate_markdown_report
 from output.pdf_generator    import generate_pdf_report
-from config import LLM_ENABLED
+from config import LLM_ENABLED, AZURE_ENABLED, GOOGLE_ENABLED, DEEPSEEK_ENABLED, GOOGLE_MODEL, DEEPSEEK_MODEL
 from data.csv_exporter      import export_features_csv
 from data.sentiment_fetcher import score_headlines
 from ml.trainer    import load_or_train
 from ml.predictor  import predict as ml_predict
+from feedback.resolver import resolve_pending
+from feedback.accuracy import get_context as get_accuracy_context
+from feedback.tracker  import save_prediction as save_feedback
 
 console = Console()
 
@@ -55,12 +59,29 @@ def parse_args() -> argparse.Namespace:
         description = "FinBot — AI-powered quantitative stock analyser",
         formatter_class = argparse.RawTextHelpFormatter,
     )
-    parser.add_argument(
+
+    # ------------------------------------------------------------------
+    # Input source — exactly one of --ticker or --file must be supplied.
+    # We use a mutually exclusive group so argparse enforces this at the
+    # CLI level and prints a clear error message when violated.
+    # ------------------------------------------------------------------
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "--ticker", "-t",
-        type    = str,
-        required= True,
-        help    = "Yahoo Finance ticker symbol (e.g. AAPL, MSFT, TSLA, 9988.HK)",
+        type = str,
+        help = "Yahoo Finance ticker symbol (e.g. AAPL, MSFT, TSLA, 9988.HK)",
     )
+    source.add_argument(
+        "--file", "-f",
+        type = str,
+        metavar = "FILE",
+        help = (
+            "Path to a plain-text watchlist file with one ticker per line.\n"
+            "Lines beginning with '#' and blank lines are ignored.\n"
+            "Example: python main.py --file tickers.txt --no-llm"
+        ),
+    )
+
     parser.add_argument(
         "--no-llm",
         action  = "store_true",
@@ -72,6 +93,15 @@ def parse_args() -> argparse.Namespace:
         action  = "store_true",
         default = False,
         help    = "Force retraining of ML models even if cached models are fresh",
+    )
+    parser.add_argument(
+        "--resolve",
+        action  = "store_true",
+        default = False,
+        help    = (
+            "Resolve pending predictions in feedback CSVs (fetch actual prices) "
+            "and exit without running a full analysis."
+        ),
     )
     return parser.parse_args()
 
@@ -98,9 +128,39 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
     report_path = None
     pdf_path = None
 
-    console.print()
-    console.print(f"[bold cyan]FinBot[/bold cyan] — Analysing [bold yellow]{ticker}[/bold yellow] ...")
-    console.print()
+    # ── Feedback: resolve pending predictions before new analysis ── #
+    try:
+        resolved_count = resolve_pending(ticker)
+        if resolved_count > 0:
+            console.log(f"[dim]Feedback: resolved {resolved_count} pending prediction(s) for {ticker}.[/dim]")
+    except Exception as fb_err:
+        console.log(f"[dim yellow]Feedback resolver error (non-fatal): {fb_err}[/dim yellow]")
+
+    # ── Feedback: load historical accuracy context (per provider) ─── #
+    mode_str = "no_llm" if skip_llm or not LLM_ENABLED else "llm"
+    accuracy_context_map: dict = {}
+    try:
+        if mode_str == "llm":
+            if AZURE_ENABLED:
+                accuracy_context_map["Azure OpenAI"] = get_accuracy_context(
+                    ticker, "llm", provider="Azure OpenAI"
+                )
+            if GOOGLE_ENABLED:
+                accuracy_context_map[f"Google Gemini ({GOOGLE_MODEL})"] = get_accuracy_context(
+                    ticker, "llm", provider=f"Google Gemini ({GOOGLE_MODEL})"
+                )
+            if DEEPSEEK_ENABLED:
+                accuracy_context_map[f"DeepSeek ({DEEPSEEK_MODEL})"] = get_accuracy_context(
+                    ticker, "llm", provider=f"DeepSeek ({DEEPSEEK_MODEL})"
+                )
+        else:
+            accuracy_context_map["rule_based"] = get_accuracy_context(
+                ticker, "no_llm", provider="rule_based"
+            )
+    except Exception:
+        pass
+    # Primary display context = first available provider's stats (or empty)
+    accuracy_context = next(iter(accuracy_context_map.values()), {"has_data": False})
 
     steps = [
         "Fetching price history & fundamentals",
@@ -139,6 +199,12 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
         progress.update(task, description=f"[2/{len(steps)}] {steps[1]}")
         analyst_data = fetch_analyst_data(ticker)
         progress.advance(task)
+
+        # Fetch options data (supplementary — non-fatal)
+        try:
+            options_data = fetch_options_data(ticker)
+        except Exception:
+            options_data = {"put_call_ratio": None, "options_iv_avg": None}
 
         # Step 3 — Technical indicators
         progress.update(task, description=f"[3/{len(steps)}] {steps[2]}")
@@ -187,7 +253,8 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
                 console.log("[dim]LLM analysis skipped via --no-llm flag — running rule-based analysis.[/dim]")
             try:
                 llm_result = run_rule_based_analysis(
-                    info, technical, fundamental, statistical, analyst_data, ml_result
+                    info, technical, fundamental, statistical, analyst_data, ml_result,
+                    accuracy_context=accuracy_context,
                 )
             except Exception as rbj_err:
                 console.log(f"[yellow]Rule-based analysis error: {rbj_err}[/yellow]")
@@ -220,7 +287,9 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
                 }
         else:
             llm_result = get_llm_analysis(
-                ticker, info, technical, fundamental, statistical, analyst_data, ml_result
+                ticker, info, technical, fundamental, statistical, analyst_data, ml_result,
+                accuracy_context=accuracy_context,
+                accuracy_context_map=accuracy_context_map,
             )
             # Always attach the rule-based judge so it can be displayed as a
             # standalone "second opinion" panel even when the LLM ran successfully.
@@ -243,7 +312,8 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
         progress.update(task, description=f"[9/{len(steps)}] {steps[8]}")
         report_path = generate_markdown_report(
             ticker, info, technical, fundamental, statistical,
-            analyst_data, llm_result, ml_result, report_dir
+            analyst_data, llm_result, ml_result, report_dir,
+            accuracy_context=accuracy_context,
         )
         progress.advance(task)
 
@@ -272,7 +342,40 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
         llm          = llm_result,
         ml_result    = ml_result,
         report_path  = report_path,
+        accuracy_context = accuracy_context,
     )
+
+    # ---- Save feedback prediction — one row per active provider ---- #
+    try:
+        if mode_str == "llm" and llm_result.get("providers"):
+            for pname, presult in llm_result["providers"].items():
+                if presult.get("recommendation") == "ERROR":
+                    continue
+                save_feedback(
+                    ticker       = ticker,
+                    mode         = mode_str,
+                    provider     = pname,
+                    price_df     = price_df,
+                    info         = info,
+                    llm_result   = presult,
+                    ml_result    = ml_result,
+                    analyst_data = analyst_data,
+                    options_data = options_data,
+                )
+        else:
+            save_feedback(
+                ticker       = ticker,
+                mode         = mode_str,
+                provider     = "rule_based",
+                price_df     = price_df,
+                info         = info,
+                llm_result   = llm_result,
+                ml_result    = ml_result,
+                analyst_data = analyst_data,
+                options_data = options_data,
+            )
+    except Exception as fb_save_err:
+        console.log(f"[dim yellow]Feedback save error (non-fatal): {fb_save_err}[/dim yellow]")
 
     if pdf_path:
         console.print(f"\n[bold green]PDF report saved:[/bold green] {pdf_path}")
@@ -284,6 +387,143 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
 # Entry point
 # ------------------------------------------------------------------ #
 
+def _read_tickers_file(path: str) -> list[str]:
+    """
+    Parse a watchlist text file into a list of ticker strings.
+
+    Rules applied during parsing:
+      • Strip leading/trailing whitespace from every line.
+      • Skip lines that start with '#' (comment lines).
+      • Skip blank lines.
+      • Normalise each ticker to uppercase so 'aapl' and 'AAPL' both work.
+
+    Parameters
+    ----------
+    path : str
+        Filesystem path to the watchlist file (e.g. 'tickers.txt').
+
+    Returns
+    -------
+    list[str]
+        Ordered, de-whitespaced ticker symbols ready for run_pipeline().
+
+    Raises
+    ------
+    SystemExit
+        If the file cannot be opened (wrong path / no permission).
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError as exc:
+        console.print(f"[bold red]ERROR:[/bold red] Cannot open watchlist file: {exc}")
+        sys.exit(1)
+
+    tickers: list[str] = []
+    for line in lines:
+        # Strip whitespace and ignore comment / blank lines.
+        token = line.strip()
+        if not token or token.startswith("#"):
+            continue
+        tickers.append(token.upper())
+
+    if not tickers:
+        console.print(
+            f"[bold yellow]WARNING:[/bold yellow] No tickers found in '{path}'. "
+            "Check the file contains at least one non-comment line."
+        )
+        sys.exit(0)
+
+    return tickers
+
+
 if __name__ == "__main__":
     args = parse_args()
-    run_pipeline(ticker=args.ticker, skip_llm=args.no_llm, retrain=args.retrain)
+
+    # ── --resolve mode: settle pending predictions and exit ────── #
+    if args.resolve:
+        from feedback.resolver import resolve_all as _resolve_all
+        target_tickers: list[str] = []
+        if args.ticker:
+            target_tickers = [args.ticker.upper().strip()]
+        elif args.file:
+            target_tickers = _read_tickers_file(args.file)
+        else:
+            # Default: resolve all tickers in tickers.txt if it exists
+            default_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tickers.txt")
+            if os.path.isfile(default_file):
+                target_tickers = _read_tickers_file(default_file)
+
+        if not target_tickers:
+            console.print("[yellow]No tickers to resolve.[/yellow]")
+            sys.exit(0)
+
+        console.print(f"\n[bold cyan]FinBot — Resolving feedback for {len(target_tickers)} ticker(s)[/bold cyan]\n")
+        total = 0
+        for t in target_tickers:
+            n = 0
+            try:
+                n = __import__("feedback.resolver", fromlist=["resolve_pending"]).resolve_pending(t)
+            except Exception as e:
+                console.print(f"  [red]{t}[/red]: error — {e}")
+                continue
+            colour = "green" if n > 0 else "dim"
+            console.print(f"  [{colour}]{t:>10}[/{colour}]  {n} outcome(s) resolved")
+            total += n
+        console.print(f"\n[bold green]Done.[/bold green] {total} total outcome(s) resolved across all tickers.\n")
+        sys.exit(0)
+
+    if args.ticker:
+        # ── Single-ticker mode ──────────────────────────────────── #
+        # Standard usage: `python main.py --ticker AAPL`
+        run_pipeline(ticker=args.ticker, skip_llm=args.no_llm, retrain=args.retrain)
+
+    else:
+        # ── Batch / watchlist mode ──────────────────────────────── #
+        # Usage: `python main.py --file tickers.txt [--no-llm] [--retrain]`
+        #
+        # The pipeline is run sequentially for each ticker in the file.
+        # Per-ticker errors are caught and logged so a bad symbol or a
+        # transient network failure does not abort the entire batch —
+        # the run simply continues with the next ticker.
+        tickers = _read_tickers_file(args.file)
+
+        console.print(
+            f"[bold cyan]FinBot batch run[/bold cyan] — "
+            f"{len(tickers)} ticker(s) from [yellow]{args.file}[/yellow]\n"
+        )
+
+        results: dict[str, str] = {}  # ticker → "ok" | error message
+
+        for idx, ticker in enumerate(tickers, start=1):
+            console.rule(
+                f"[bold]{idx}/{len(tickers)}[/bold]  {ticker}",
+                style="cyan",
+            )
+            try:
+                run_pipeline(
+                    ticker   = ticker,
+                    skip_llm = args.no_llm,
+                    retrain  = args.retrain,
+                )
+                results[ticker] = "ok"
+            except SystemExit:
+                # run_pipeline calls sys.exit(1) on an invalid ticker —
+                # intercept it here so the batch does not terminate early.
+                results[ticker] = "invalid ticker / no data"
+                console.print(
+                    f"[yellow]Skipping {ticker} — no price data found.[/yellow]\n"
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Catch any unexpected exception so the batch keeps running.
+                results[ticker] = str(exc)
+                console.print(
+                    f"[bold red]ERROR[/bold red] processing {ticker}: {exc}\n"
+                )
+
+        # ── Final summary table ─────────────────────────────────── #
+        console.rule("[bold cyan]Batch Summary[/bold cyan]", style="cyan")
+        for sym, status in results.items():
+            colour = "green" if status == "ok" else "red"
+            console.print(f"  [{colour}]{sym:>10}[/{colour}]  {status}")
+        console.print()

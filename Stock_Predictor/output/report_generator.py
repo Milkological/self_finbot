@@ -252,6 +252,7 @@ def generate_markdown_report(
     llm: dict,
     ml_result: dict | None,
     dir_path: str,
+    accuracy_context: dict = None,
 ) -> str:
     """
     Assemble the full Markdown report and save it to dir_path/report.md.
@@ -542,8 +543,42 @@ def generate_markdown_report(
             A("")
         A("> ⚠ *ML predictions are based on historical patterns and are not financial advice.*\n")
 
+    # Historical Accuracy (Feedback Loop)
+    if accuracy_context and accuracy_context.get("has_data"):
+        A("## Historical Accuracy (Feedback Loop)\n")
+        total = accuracy_context.get("total_resolved", 0)
+        A(f"*Based on {total} resolved past prediction(s) for this ticker.*\n")
+        A("| Horizon | N | Direction Accuracy | Mean Bias | Correction Factor |")
+        A("|---------|---|-------------------|-----------|-------------------|")
+        for h, stats in accuracy_context.get("horizon_stats", {}).items():
+            n    = stats.get("n", 0)
+            acc  = stats.get("dir_accuracy")
+            bias = stats.get("mean_bias")
+            cf   = stats.get("correction_factor", 1.0)
+            acc_str  = f"{acc*100:.0f}%" if isinstance(acc, float) else "—"
+            bias_str = f"{bias:+.2%}" if isinstance(bias, float) else "—"
+            cf_str   = f"{cf:.3f}" if abs((cf or 1.0) - 1.0) > 0.001 else "1.000 (inactive)"
+            A(f"| {h.upper()} | {n} | {acc_str} | {bias_str} | {cf_str} |")
+        rhr = accuracy_context.get("rec_hit_rate")
+        if isinstance(rhr, float):
+            A(f"\n**Recommendation Hit Rate:** {rhr*100:.0f}%\n")
+        if accuracy_context.get("weights_adjusted"):
+            aw = accuracy_context.get("adjusted_weights", {})
+            A("**Dynamically Adjusted Lens Weights:** "
+              + ", ".join(f"{k.title()} {v:.0%}" for k, v in aw.items()) + "\n")
+        A("")
+
     # LLM Recommendation
     A("## AI Analyst Recommendation\n")
+
+    # Providers used
+    active_providers = [
+        p for p, r in llm.get("providers", {}).items()
+        if r.get("recommendation") != "ERROR"
+    ]
+    if active_providers:
+        A(f"**Providers used:** {' · '.join(active_providers)}\n")
+
     if not llm.get("llm_available"):
         A(f"> ⚠ **LLM Not Available:** {llm.get('summary','')}\n")
         rbj = llm.get("rule_based_judge")
