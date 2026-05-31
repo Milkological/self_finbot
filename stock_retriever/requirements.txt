@@ -1,0 +1,11 @@
+# Core Reddit API wrapper — used to authenticate with Reddit and fetch posts/comments.
+praw>=7.7.0
+
+# Sentiment analysis library optimized for social media text (slang, caps, punctuation).
+vaderSentiment>=3.3.2
+
+# Loads credentials from a .env file into environment variables at runtime.
+python-dotenv>=1.0.0
+
+# Test framework used to run all unit tests in the tests/ folder.
+pytest>=7.4.0
