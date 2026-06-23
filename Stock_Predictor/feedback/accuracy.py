@@ -14,9 +14,11 @@ and used to reweight the rule-based judge.
 """
 
 import os
+import json
+import statistics
 import pandas as pd
 
-from config import FEEDBACK_DIR, FEEDBACK_MIN_SAMPLES, FEEDBACK_MAX_BIAS_CORRECTION
+from config import FEEDBACK_DIR, FEEDBACK_MIN_SAMPLES, FEEDBACK_MAX_BIAS_CORRECTION, CALIBRATION_MIN_SAMPLES, ML_MODELS_DIR
 
 HORIZONS = ["1w", "2w", "3w", "1m", "3m", "6m", "9m", "12m"]
 
@@ -84,7 +86,9 @@ def get_context(ticker: str, mode: str = "llm", provider: str | None = None) -> 
         return empty
 
     try:
-        df = pd.read_csv(path, dtype=str)
+        # on_bad_lines='skip' tolerates rows written by older versions that had
+        # a different column count (e.g. before the 'provider' column was added).
+        df = pd.read_csv(path, dtype=str, on_bad_lines="skip")
     except Exception:
         return empty
 
@@ -134,25 +138,33 @@ def get_context(ticker: str, mode: str = "llm", provider: str | None = None) -> 
         dir_vals = [v for v in dir_vals if v is not None]
         dir_acc  = round(sum(dir_vals) / len(dir_vals) * 100, 1) if dir_vals else None
 
-        # Mean signed bias
+        # Signed bias — use the MEDIAN, which is robust to the occasional
+        # huge outlier a volatile horizon produces (a single +120% error
+        # would drag the mean and swing every future target).
         err_vals = [_safe_float(v) for v in resolved[err_col] if err_col in resolved.columns]
         err_vals = [v for v in err_vals if v is not None]
-        mean_bias = round(sum(err_vals) / len(err_vals), 2) if err_vals else None
+        median_bias = round(statistics.median(err_vals), 2) if err_vals else None
 
         # Bias correction factor (only when N >= MIN_SAMPLES)
         correction_factor = 1.0
-        if n >= FEEDBACK_MIN_SAMPLES and mean_bias is not None:
-            # mean_bias is in %; convert to fraction
-            raw_correction = mean_bias / 100.0
-            # positive bias = LLM undershot → multiply up; negative = overshot → multiply down
+        if n >= FEEDBACK_MIN_SAMPLES and median_bias is not None:
+            # median_bias is in %; convert to fraction.
+            # positive bias = targets undershot → multiply up; negative = overshot → down
+            raw_correction = median_bias / 100.0
             clamped = max(-FEEDBACK_MAX_BIAS_CORRECTION,
                           min(FEEDBACK_MAX_BIAS_CORRECTION, raw_correction))
-            correction_factor = round(1.0 + clamped, 4)
+            # Shrink toward 1.0 on thin samples: at N == MIN_SAMPLES only half
+            # of the correction is applied; full strength once N >= 2*MIN_SAMPLES.
+            # Prevents 5 data points from moving targets as hard as 20+ do.
+            shrink = min(1.0, n / (2.0 * FEEDBACK_MIN_SAMPLES))
+            correction_factor = round(1.0 + clamped * shrink, 4)
 
         horizon_stats[h] = {
             "n":                n,
             "dir_accuracy":     dir_acc,
-            "mean_bias":        mean_bias,
+            # key kept as "mean_bias" for backward compatibility with callers;
+            # value is now the median signed error.
+            "mean_bias":        median_bias,
             "correction_factor": correction_factor,
         }
 
@@ -238,6 +250,89 @@ def get_context(ticker: str, mode: str = "llm", provider: str | None = None) -> 
         "total_resolved":   total_resolved,
         "has_data":         total_resolved > 0,
     }
+
+
+def build_calibration_table(ticker: str) -> dict:
+    """
+    Build a probability calibration lookup table from resolved feedback rows
+    and save it to  models/{TICKER}/calibration.json.
+
+    Buckets the raw ``ml_Xd_prob_up`` values into ranges and computes the
+    empirical direction-accuracy per bucket.  The predictor then replaces
+    raw model probabilities with these empirical values, giving
+    calibrated confidence estimates.
+
+    Activated only when resolved rows >= CALIBRATION_MIN_SAMPLES.
+
+    Returns
+    -------
+    dict  — calibration table written (or existing) keyed by "5d" / "21d".
+            Returns empty dict when there is insufficient data.
+    """
+    path = _csv_path(ticker)
+    if not os.path.isfile(path):
+        return {}
+
+    try:
+        # on_bad_lines="skip" matches get_context/resolver so a single stray
+        # malformed row (e.g. the "saw 73 fields" corruption in some CSVs)
+        # no longer makes calibration silently throw and never build.
+        df = pd.read_csv(path, dtype=str, on_bad_lines="skip")
+    except Exception:
+        return {}
+
+    if df.empty:
+        return {}
+
+    # Only use resolved rows (have ml_Xd_correct filled)
+    def _has_col(col):
+        return col in df.columns
+
+    result = {}
+
+    buckets_def = [
+        (0.0, 0.3), (0.3, 0.4), (0.4, 0.5),
+        (0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 1.01),
+    ]
+
+    for h_label, prob_col, correct_col in [
+        ("5d",  "ml_5d_prob_up",  "ml_5d_correct"),
+        ("21d", "ml_21d_prob_up", "ml_21d_correct"),
+    ]:
+        if not (_has_col(prob_col) and _has_col(correct_col)):
+            continue
+
+        sub = df[[prob_col, correct_col]].copy()
+        sub[prob_col]    = pd.to_numeric(sub[prob_col],    errors="coerce")
+        sub[correct_col] = pd.to_numeric(sub[correct_col], errors="coerce")
+        sub = sub.dropna()
+
+        if len(sub) < CALIBRATION_MIN_SAMPLES:
+            continue
+
+        buckets = []
+        for lo, hi in buckets_def:
+            mask  = (sub[prob_col] >= lo) & (sub[prob_col] < hi)
+            chunk = sub[mask]
+            if len(chunk) >= 3:                      # need at least 3 data points
+                empirical = round(float(chunk[correct_col].mean()), 4)
+                buckets.append({"lo": lo, "hi": hi, "n": len(chunk), "empirical": empirical})
+
+        if buckets:
+            result[h_label] = buckets
+
+    if result:
+        cal_path = os.path.join(ML_MODELS_DIR, ticker.upper(), "calibration.json")
+        os.makedirs(os.path.dirname(cal_path), exist_ok=True)
+        try:
+            with open(cal_path, "w") as f:
+                json.dump(result, f, indent=2)
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("Could not save calibration table: %s", exc)
+
+    return result
+
 
 
 def apply_bias_correction(targets: dict, accuracy_context: dict) -> dict:
@@ -352,6 +447,42 @@ def format_llm_injection(ticker: str, accuracy_context: dict) -> str:
         lines.append(f"ML 21-day forward accuracy: {ml['21d']:.0f}%")
     if rec is not None:
         lines.append(f"Overall recommendation hit rate: {rec*100:.0f}%")
+
+    # ── Grounding: anchor accuracy_pct to REALIZED accuracy ───────── #
+    lines.append(
+        f"\nINSTRUCTION (GROUNDING): For every horizon with N >= {FEEDBACK_MIN_SAMPLES} "
+        "predictions, use that horizon's realized Directional Accuracy above as the BASE "
+        "for its accuracy_pct — NOT the ML test-split accuracy. Then apply only the small "
+        "VIX/agreement adjustments and the standard [30%, 85%] clamp. Horizons with no "
+        "track record fall back to the ML-derived base."
+    )
+
+    # ── Caution rules tied to the live recommendation hit rate ────── #
+    if rec is not None and rec < 0.40:
+        lines.append(
+            f"TRACK-RECORD CAUTION: live recommendation hit rate is {rec*100:.0f}% "
+            "(below 40%) — cap confidence at LOW and prefer HOLD unless the signals "
+            "strongly align."
+        )
+    elif rec is not None and rec < 0.50:
+        lines.append(
+            f"TRACK-RECORD CAUTION: live recommendation hit rate is {rec*100:.0f}% "
+            "(below 50%) — cap confidence at MEDIUM."
+        )
+
+    # Flag individual horizons that have been worse than a coin flip.
+    weak = [
+        horizon_labels[h] for h in horizon_labels
+        if stats.get(h, {}).get("n", 0) >= FEEDBACK_MIN_SAMPLES
+        and (stats.get(h, {}).get("dir_accuracy") is not None)
+        and stats[h]["dir_accuracy"] < 45.0
+    ]
+    if weak:
+        lines.append(
+            "LOW-ACCURACY HORIZONS (realized directional accuracy <45%): "
+            + ", ".join(weak)
+            + " — assign these LOW confidence and widen or avoid their targets."
+        )
 
     lines.append(
         "\nINSTRUCTION: Calibrate your price targets using the bias data above. "

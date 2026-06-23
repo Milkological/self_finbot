@@ -99,11 +99,13 @@ class TestSavePrediction(unittest.TestCase):
 
     def _call_save(self, provider: str = "Azure OpenAI"):
         """Import and call save_prediction with the temp FEEDBACK_DIR patched."""
+        # NOTE: do NOT importlib.reload() the module here. _csv_path() reads the
+        # module-level FEEDBACK_DIR at call time, so patching the attribute is
+        # sufficient. Reloading re-runs `from config import FEEDBACK_DIR`, which
+        # rebinds the name back to the real path and defeats the patch — that
+        # caused tests to write to the real feedback/ dir and accumulate rows.
         with patch("feedback.tracker.FEEDBACK_DIR", self._tmpdir):
-            # Re-import to pick up the patched constant inside the module
-            import importlib
             import feedback.tracker as mod
-            importlib.reload(mod)
             return mod.save_prediction(
                 ticker       = "FAKE",
                 mode         = "llm",
@@ -157,9 +159,7 @@ class TestSavePrediction(unittest.TestCase):
 
     def test_empty_ml_result_does_not_raise(self):
         with patch("feedback.tracker.FEEDBACK_DIR", self._tmpdir):
-            import importlib
             import feedback.tracker as mod
-            importlib.reload(mod)
             # Should not raise even with minimal inputs
             mod.save_prediction(
                 ticker       = "FAKE",

@@ -40,22 +40,49 @@ def _csv_path(ticker: str) -> str:
     return os.path.join(FEEDBACK_DIR, f"{ticker.upper()}_feedback.csv")
 
 
-def _fetch_price_on_or_before(ticker: str, target_date: datetime.date) -> float | None:
+def _load_price_history(ticker: str, start: str, end: str) -> "pd.Series | None":
     """
-    Fetch the closing price on target_date or the most recent trading day before it.
-    Uses a small window (target_date - 7d → target_date + 1d) to handle weekends/holidays.
+    Download the ticker's daily close prices once for the whole [start, end)
+    span and return them as a sorted, tz-naive Series indexed by date.
+
+    Fetching the full span a single time (rather than once per horizon per
+    row) collapses what used to be hundreds/thousands of network calls into
+    one. Returns None on any failure so the caller degrades gracefully.
+
+    NOTE: `show_errors` was removed from modern yfinance and raises TypeError
+    if passed — its previous use here silently broke all live resolution.
     """
-    start = (target_date - datetime.timedelta(days=7)).isoformat()
-    end   = (target_date + datetime.timedelta(days=1)).isoformat()
     try:
         df = yf.download(ticker, start=start, end=end, auto_adjust=True,
-                         progress=False, show_errors=False)
-        if df.empty:
+                         progress=False)
+        if df is None or df.empty:
             return None
-        # Normalise column names if yfinance returns MultiIndex
+        # Normalise column names if yfinance returns MultiIndex (field, ticker)
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-        return float(df["Close"].iloc[-1])
+        series = df["Close"].copy()
+        series.index = pd.to_datetime(series.index)
+        if series.index.tz is not None:
+            series.index = series.index.tz_localize(None)
+        return series.sort_index()
+    except Exception:
+        return None
+
+
+def _price_on_or_before(series: "pd.Series | None",
+                        target_date: datetime.date) -> float | None:
+    """
+    Return the close on ``target_date`` or the most recent trading day before
+    it, looked up locally from a pre-fetched price Series. Handles weekends /
+    holidays automatically because it takes the last value at-or-before the date.
+    """
+    if series is None or len(series) == 0:
+        return None
+    try:
+        sub = series.loc[:pd.Timestamp(target_date)]
+        if len(sub) == 0:
+            return None
+        return float(sub.iloc[-1])
     except Exception:
         return None
 
@@ -72,7 +99,15 @@ def resolve_pending(ticker: str) -> int:
         return 0
 
     try:
-        df = pd.read_csv(path, dtype=str)
+        # on_bad_lines='skip' tolerates rows written by older versions that had
+        # a different column count (e.g. before the 'provider' column was added).
+        # keep_default_na=False + astype(object): pandas>=3 reads dtype=str as a
+        # strict StringDtype that raises when we later write numeric outcomes
+        # back into a cell. Reading blanks as "" and using object dtype lets us
+        # assign floats/ints to the outcome columns (and keeps the ""/"nan"
+        # blank-detection used throughout this module working).
+        df = pd.read_csv(path, dtype=str, on_bad_lines="skip", keep_default_na=False)
+        df = df.astype(object)
     except Exception:
         return 0
 
@@ -81,6 +116,35 @@ def resolve_pending(ticker: str) -> int:
 
     today       = datetime.date.today()
     rows_updated = 0
+
+    # ── Pre-scan: is anything actually resolvable, and how far back? ─── #
+    # We only hit the network if at least one (row, horizon) is both
+    # unresolved and past its calendar window. The earliest such run_date
+    # bounds the single batched price-history download below.
+    earliest_run: datetime.date | None = None
+    for _, row in df.iterrows():
+        try:
+            rd = datetime.date.fromisoformat(str(row["run_date"]))
+        except (ValueError, TypeError):
+            continue
+        for h in HORIZONS:
+            if str(row.get(f"actual_{h}", "")).strip() not in ("", "nan"):
+                continue
+            if today >= rd + datetime.timedelta(days=HORIZON_CALENDAR_DAYS[h]):
+                if earliest_run is None or rd < earliest_run:
+                    earliest_run = rd
+                break
+
+    if earliest_run is None:
+        return 0  # nothing has matured yet — skip the network call entirely
+
+    price_series = _load_price_history(
+        ticker,
+        (earliest_run - datetime.timedelta(days=10)).isoformat(),
+        (today + datetime.timedelta(days=2)).isoformat(),
+    )
+    if price_series is None:
+        return 0  # could not fetch prices — leave rows pending for next run
 
     for idx, row in df.iterrows():
         try:
@@ -111,8 +175,8 @@ def resolve_pending(ticker: str) -> int:
             if today < resolve_after:
                 continue
 
-            # Fetch actual price
-            actual_price = _fetch_price_on_or_before(ticker, resolve_after)
+            # Look up actual price from the single pre-fetched history
+            actual_price = _price_on_or_before(price_series, resolve_after)
             if actual_price is None:
                 continue
 

@@ -312,6 +312,73 @@ def generate_markdown_report(
     A(f"\n> **Generated:** {run_date}  |  **Current Price:** ${price}  |  **Sector:** {sector}\n")
     A("---\n")
 
+    # ── Executive Summary (bottom-line-up-front) ──────────────────── #
+    # The verdict is the first thing a reader sees, before the supporting
+    # analysis sections below.
+    if llm.get("llm_available"):
+        es_rec     = llm.get("recommendation", "N/A")
+        es_conf    = llm.get("confidence", "N/A")
+        es_ost     = llm.get("overall_short_term", "N/A")
+        es_olt     = llm.get("overall_long_term", "N/A")
+        es_targets = llm.get("target_prices", {}) or {}
+        es_summary = llm.get("summary", "")
+        es_bull    = llm.get("key_bull_case", []) or []
+        es_risk    = llm.get("key_risks", []) or []
+        es_src     = "AI Analyst Pipeline"
+    else:
+        _rbj       = llm.get("rule_based_judge") or {}
+        es_rec     = _rbj.get("recommendation", llm.get("recommendation", "N/A"))
+        es_conf    = _rbj.get("confidence", "N/A")
+        es_ost     = es_olt = "N/A"
+        es_targets = {}
+        es_summary = _rbj.get("summary", llm.get("summary", ""))
+        es_bull    = []
+        es_risk    = []
+        es_src     = "Rule-Based Judge (no LLM)"
+
+    def _es_target(key):
+        e = es_targets.get(key)
+        if isinstance(e, dict):
+            return e.get("price")
+        if isinstance(e, (int, float)) and e:
+            return e
+        return None
+
+    A("## Executive Summary\n")
+    A("| Item | Verdict |")
+    A("|---|---|")
+    A(f"| **Recommendation** | **{es_rec}**  (confidence: {es_conf}) |")
+    A(f"| **Current Price** | ${price} |")
+    _kt, _kl = _es_target("1_month"), "1-Month"
+    if _kt is None:
+        _kt, _kl = _es_target("12_months"), "12-Month"
+    if _kt and isinstance(price, (int, float)):
+        _chg = (_kt - price) / price * 100
+        A(f"| **{_kl} Target** | ${_kt}  ({_chg:+.1f}%) |")
+    if es_ost not in (None, "N/A"):
+        A(f"| **Short-term Outlook** | {es_ost} |")
+    if es_olt not in (None, "N/A"):
+        A(f"| **Long-term Outlook** | {es_olt} |")
+    if es_bull:
+        A(f"| **Top Bull Point** | {es_bull[0]} |")
+    if es_risk:
+        A(f"| **Top Risk** | {es_risk[0]} |")
+    A(f"| **Source** | {es_src} |")
+    A("")
+    if es_summary:
+        A(f"> {es_summary}\n")
+
+    # ── Contents ──────────────────────────────────────────────────── #
+    A("## Contents\n")
+    A("- [Company Overview](#company-overview)")
+    A("- [Technical Analysis](#technical-analysis)")
+    A("- [Fundamental Analysis](#fundamental-analysis)")
+    A("- [Statistical Analysis](#statistical-analysis)")
+    A("- [Analyst Consensus](#analyst-consensus)")
+    A("- [ML Predictions](#ml-predictions-gradientboosting)")
+    A("- [AI Analyst Recommendation](#ai-analyst-recommendation)")
+    A("\n---\n")
+
     # Overview
     A("## Company Overview\n")
     A("| Field | Value |")

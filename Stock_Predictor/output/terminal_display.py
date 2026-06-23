@@ -47,6 +47,52 @@ def _pct_colour(pct: float) -> str:
 
 
 # ------------------------------------------------------------------ #
+# Layout helpers — consistent section dividers & tables
+# ------------------------------------------------------------------ #
+# Each analysis domain gets its OWN accent colour so the eye can tell
+# sections apart at a glance instead of every divider being cyan.
+SECTION_ACCENT = {
+    "COMPANY":     "bright_cyan",
+    "TECHNICAL":   "blue",
+    "FUNDAMENTAL": "green",
+    "STATISTICAL": "cyan",
+    "ANALYST":     "yellow",
+    "ML":          "magenta",
+    "ACCURACY":    "bright_yellow",
+}
+
+
+def _section(title: str, accent: str = "cyan", icon: str = "") -> None:
+    """Print a consistent, colour-coded section divider with leading spacing.
+
+    Colouring the rule line itself (style=accent) — not just the title — is
+    what makes each domain visually distinct when scanning the report.
+    """
+    console.print()
+    label = f"{icon}  {title}" if icon else title
+    console.print(Rule(f"[bold {accent}]{label}[/bold {accent}]", style=accent))
+
+
+def _std_table(title: str | None = None, accent: str = "magenta") -> Table:
+    """A table with house styling: header + title share the section accent.
+
+    Keeping one factory ensures every table reads the same way; the accent
+    ties each table back to the domain section it belongs to. Signal cells
+    keep their own green/red markup (no row striping that would mute them).
+    """
+    return Table(
+        box=box.SIMPLE_HEAD,
+        show_header=True,
+        header_style=f"bold {accent}",
+        title=title,
+        title_style=f"bold {accent}",
+        title_justify="left",
+        padding=(0, 1),
+        expand=False,
+    )
+
+
+# ------------------------------------------------------------------ #
 # Section 1: Header
 # ------------------------------------------------------------------ #
 
@@ -74,12 +120,121 @@ def display_header(ticker: str, info: dict) -> None:
 
 
 # ------------------------------------------------------------------ #
+# Section 1b: Executive Summary  (bottom-line-up-front)
+# ------------------------------------------------------------------ #
+
+def _target_price(targets: dict, key: str):
+    """Pull a numeric price out of a target_prices entry (dict or scalar)."""
+    e = targets.get(key)
+    if isinstance(e, dict):
+        return e.get("price")
+    if isinstance(e, (int, float)) and e:
+        return e
+    return None
+
+
+def display_executive_summary(
+    ticker: str,
+    info: dict,
+    llm: dict,
+    ml_result: dict | None = None,
+) -> None:
+    """Render a bottom-line-up-front summary so the verdict is the FIRST
+    thing a user sees, instead of being buried under every analysis section.
+
+    Works in both modes: LLM (uses the primary Judge result) and --no-llm
+    (falls back to the deterministic rule-based judge)."""
+    price    = info.get("currentPrice")
+    llm_ok   = llm.get("llm_available")
+
+    if llm_ok:
+        rec     = llm.get("recommendation", "N/A")
+        conf    = llm.get("confidence", "N/A")
+        ost     = llm.get("overall_short_term")
+        olt     = llm.get("overall_long_term")
+        targets = llm.get("target_prices", {}) or {}
+        summary = llm.get("summary", "")
+        bull    = llm.get("key_bull_case", []) or []
+        risks   = llm.get("key_risks", []) or []
+        source  = "AI Analyst Pipeline"
+    else:
+        rbj     = llm.get("rule_based_judge") or {}
+        rec     = rbj.get("recommendation", llm.get("recommendation", "N/A"))
+        conf    = rbj.get("confidence", "N/A")
+        ost     = olt = None
+        targets = {}
+        summary = rbj.get("summary", llm.get("summary", ""))
+        bull    = []
+        risks   = []
+        source  = "Rule-Based Judge (no LLM)"
+
+    rec_colour = "green" if "BUY" in rec.upper() else "red" if "SELL" in rec.upper() else "yellow"
+
+    def _vc(v):
+        return "green" if v == "WORTH_INVESTING" else "red" if v == "NOT_WORTH_INVESTING" else "yellow"
+
+    # ── Build a compact aligned grid ──────────────────────────────── #
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(justify="left",  style="bold")
+    grid.add_column(justify="left")
+
+    grid.add_row("Recommendation", f"[bold {rec_colour}]{rec}[/bold {rec_colour}]   [dim]Confidence: {conf}[/dim]")
+
+    if price is not None:
+        # Prefer a 1-month target, fall back to 12-month, for the headline move.
+        key_lbl, key_tk = ("1-Month", "1_month")
+        tgt = _target_price(targets, "1_month")
+        if tgt is None:
+            tgt = _target_price(targets, "12_months")
+            key_lbl = "12-Month"
+        price_cell = f"[bold yellow]${price}[/bold yellow]"
+        if tgt:
+            chg = (tgt - price) / price * 100
+            price_cell += f"   →   {key_lbl} target [yellow]${tgt}[/yellow] ({_pct_colour(chg)})"
+        grid.add_row("Price", price_cell)
+
+    if ost or olt:
+        grid.add_row(
+            "Outlook",
+            f"Short-term [{_vc(ost)}]{ost}[/{_vc(ost)}]   "
+            f"Long-term [{_vc(olt)}]{olt}[/{_vc(olt)}]",
+        )
+
+    # One-line ML cross-check
+    if ml_result and ml_result.get("status") == "ok":
+        d21 = ml_result.get("clf_21d_direction", "N/A")
+        p21 = ml_result.get("clf_21d_prob_up")
+        dc  = "green" if d21 == "UP" else "red" if d21 == "DOWN" else "yellow"
+        p21s = f" ({p21:.0%})" if isinstance(p21, (int, float)) else ""
+        grid.add_row("ML (21d)", f"[{dc}]{d21}[/{dc}]{p21s}  [dim]model cross-check[/dim]")
+
+    if bull:
+        grid.add_row("Top Bull", f"[green]✓[/green] {bull[0]}")
+    if risks:
+        grid.add_row("Top Risk", f"[red]⚠[/red] {risks[0]}")
+
+    body = [grid]
+    if summary:
+        body.append(Text.from_markup(f"\n[dim]{summary}[/dim]"))
+
+    console.print()
+    console.print(Panel(
+        RenderGroup(*body),
+        title=f"[bold {rec_colour}]◆  EXECUTIVE SUMMARY — {ticker}  ◆[/bold {rec_colour}]",
+        subtitle=f"[dim]source: {source}[/dim]",
+        border_style=rec_colour,
+        expand=False,
+        padding=(1, 2),
+    ))
+
+
+# ------------------------------------------------------------------ #
 # Section 2: Basic Description
 # ------------------------------------------------------------------ #
 
 def display_basic_description(llm: dict, info: dict) -> None:
     """Render the company background panel (sourced from yfinance — no LLM)."""
-    console.print(Rule("[bold cyan]COMPANY DESCRIPTION[/bold cyan]"))
+    _section("COMPANY DESCRIPTION", SECTION_ACCENT["COMPANY"])
 
     # Description is now always a plain yfinance dict at the top level
     desc = llm.get("description")
@@ -122,7 +277,8 @@ def display_basic_description(llm: dict, info: dict) -> None:
 # ------------------------------------------------------------------ #
 
 def display_technical(technical: dict) -> None:
-    console.print(Rule("[bold cyan]TECHNICAL ANALYSIS[/bold cyan]"))
+    accent = SECTION_ACCENT["TECHNICAL"]
+    _section("TECHNICAL ANALYSIS", accent)
 
     latest  = technical.get("latest", {})
     signals = technical.get("signals", {})
@@ -130,7 +286,7 @@ def display_technical(technical: dict) -> None:
     pivots  = technical.get("pivot_levels", {})
 
     # ---- Indicator values table ------------------------------------ #
-    tbl = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold magenta")
+    tbl = _std_table(accent=accent)
     tbl.add_column("Indicator",   style="cyan",  no_wrap=True)
     tbl.add_column("Value",       style="white", justify="right")
     tbl.add_column("Signal",      no_wrap=False)
@@ -156,7 +312,7 @@ def display_technical(technical: dict) -> None:
     console.print(tbl)
 
     # ---- Key Levels ------------------------------------------------ #
-    lev_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold magenta", title="Key Price Levels")
+    lev_tbl = _std_table(title="Key Price Levels", accent=accent)
     lev_tbl.add_column("Fibonacci Level", style="cyan")
     lev_tbl.add_column("Price",           justify="right")
     lev_tbl.add_column("",               style="dim", justify="left")
@@ -177,7 +333,8 @@ def display_technical(technical: dict) -> None:
 # ------------------------------------------------------------------ #
 
 def display_fundamental(fundamental: dict) -> None:
-    console.print(Rule("[bold cyan]FUNDAMENTAL ANALYSIS[/bold cyan]"))
+    accent = SECTION_ACCENT["FUNDAMENTAL"]
+    _section("FUNDAMENTAL ANALYSIS", accent)
 
     pe     = fundamental.get("pe", {})
     peg    = fundamental.get("peg", {})
@@ -185,7 +342,7 @@ def display_fundamental(fundamental: dict) -> None:
     dcf    = fundamental.get("dcf", {})
     pb_div = fundamental.get("pb_div", {})
 
-    tbl = Table(box=box.SIMPLE_HEAD, header_style="bold magenta")
+    tbl = _std_table(accent=accent)
     tbl.add_column("Metric",  style="cyan", no_wrap=True)
     tbl.add_column("Value",   justify="right")
     tbl.add_column("Signal / Interpretation")
@@ -207,7 +364,8 @@ def display_fundamental(fundamental: dict) -> None:
 # ------------------------------------------------------------------ #
 
 def display_statistical(statistical: dict) -> None:
-    console.print(Rule("[bold cyan]STATISTICAL ANALYSIS[/bold cyan]"))
+    accent = SECTION_ACCENT["STATISTICAL"]
+    _section("STATISTICAL ANALYSIS", accent)
 
     vol     = statistical.get("volatility", {})
     beta    = statistical.get("beta", {})
@@ -218,7 +376,7 @@ def display_statistical(statistical: dict) -> None:
     mc      = statistical.get("monte_carlo", {})
 
     # Risk metrics table
-    risk_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold magenta", title="Risk Metrics")
+    risk_tbl = _std_table(title="Risk Metrics", accent=accent)
     risk_tbl.add_column("Metric",  style="cyan")
     risk_tbl.add_column("Value",   justify="right")
     risk_tbl.add_column("Signal")
@@ -263,8 +421,9 @@ def display_statistical(statistical: dict) -> None:
     # Linear regression predictions
     reg_preds = reg.get("predictions", {})
     if reg_preds:
-        reg_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold magenta",
-                        title=f"Linear Regression Predictions  [dim](R² = {reg.get('r_squared','N/A')}  Trend: {reg.get('trend_dir','')})[/dim]")
+        reg_tbl = _std_table(
+            title=f"Linear Regression Predictions  [dim](R² = {reg.get('r_squared','N/A')}  Trend: {reg.get('trend_dir','')})[/dim]",
+            accent=accent)
         reg_tbl.add_column("Horizon", style="cyan")
         reg_tbl.add_column("Price Target",  justify="right")
         reg_tbl.add_column("Expected Move", justify="right")
@@ -277,8 +436,9 @@ def display_statistical(statistical: dict) -> None:
     if mc_preds:
         mc_params = mc.get('params', {})
         mc_mu_method = mc_params.get('mu_method', 'historical')
-        mc_tbl = Table(box=box.SIMPLE_HEAD, header_style="bold magenta",
-                       title=f"Monte Carlo GBM  [dim]({mc_params.get('n_paths',1000):,} paths | drift: {mc_mu_method})[/dim]")
+        mc_tbl = _std_table(
+            title=f"Monte Carlo GBM  [dim]({mc_params.get('n_paths',1000):,} paths | drift: {mc_mu_method})[/dim]",
+            accent=accent)
         mc_tbl.add_column("Horizon",       style="cyan")
         mc_tbl.add_column("Bear (P10)",    justify="right", style="red")
         mc_tbl.add_column("Median (P50)",  justify="right", style="yellow")
@@ -298,7 +458,8 @@ def display_statistical(statistical: dict) -> None:
 # ------------------------------------------------------------------ #
 
 def display_analyst(analyst_data: dict) -> None:
-    console.print(Rule("[bold cyan]ANALYST CONSENSUS[/bold cyan]"))
+    accent = SECTION_ACCENT["ANALYST"]
+    _section("ANALYST CONSENSUS", accent)
 
     rec_key = analyst_data.get("recommendation_key", "N/A").upper()
     pt      = analyst_data.get("price_target") or {}
@@ -314,10 +475,7 @@ def display_analyst(analyst_data: dict) -> None:
     # ---- Analyst upgrade/downgrade history table ------------------- #
     if recs:
         console.print()
-        recs_tbl = Table(
-            box=box.SIMPLE_HEAD, header_style="bold magenta",
-            title="Recent Analyst Actions (most recent first)"
-        )
+        recs_tbl = _std_table(title="Recent Analyst Actions (most recent first)", accent=accent)
         recs_tbl.add_column("Date",       style="cyan",  no_wrap=True, min_width=10)
         recs_tbl.add_column("Firm",       style="white", min_width=20)
         recs_tbl.add_column("Action",     justify="center", min_width=11)
@@ -1342,6 +1500,8 @@ def display_full_report(
         If provided, prints a footer indicating where the report was saved.
     """
     display_header(ticker, info)
+    # Bottom-line-up-front: show the verdict before the supporting analysis.
+    display_executive_summary(ticker, info, llm, ml_result)
     display_basic_description(llm, info)
 
     # ── Active LLM providers ────────────────────────────────────── #

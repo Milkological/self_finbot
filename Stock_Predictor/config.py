@@ -73,13 +73,16 @@ MAX_RISK_PER_TRADE: float = float(os.getenv("MAX_RISK_PER_TRADE", "0.01"))  # 1 
 # Data-fetch settings
 # ------------------------------------------------------------------
 # Length of historical price data fetched from Yahoo Finance.
-HISTORY_PERIOD: str = "2y"   # 2 years of daily OHLCV data
+# 5 years gives ~1,250 daily rows (vs ~500 for 2y), substantially
+# improving ML model accuracy by providing more training examples.
+HISTORY_PERIOD: str = "5y"   # 5 years of daily OHLCV data
 
 # Benchmark ticker used for Beta calculation.
 BENCHMARK_TICKER: str = "SPY"
 
 # Number of Monte Carlo simulation paths.
-MONTE_CARLO_PATHS: int = 1000
+# 2500 paths give tighter confidence intervals with minimal additional runtime.
+MONTE_CARLO_PATHS: int = 2500
 
 # Prediction horizons in *trading* days (approx 252 per year).
 PREDICTION_HORIZONS: dict[str, int] = {
@@ -135,3 +138,11 @@ ML_MIN_TRAIN_ROWS: int = int(os.getenv("ML_MIN_TRAIN_ROWS", "100"))
 # Number of days after which persisted models are considered stale and
 # will be automatically retrained on the next run.
 ML_RETRAIN_DAYS: int = int(os.getenv("ML_RETRAIN_DAYS", "7"))
+
+# Minimum out-of-sample (test-split) rows required before the backfiller
+# writes historical predictions to the feedback CSV.
+BACKFILL_MIN_TEST_ROWS: int = int(os.getenv("BACKFILL_MIN_TEST_ROWS", "20"))
+
+# Minimum resolved rows required before probability calibration is built.
+# Calibration buckets probabilities and maps them to empirical accuracy.
+CALIBRATION_MIN_SAMPLES: int = int(os.getenv("CALIBRATION_MIN_SAMPLES", "10"))

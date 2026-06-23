@@ -28,7 +28,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor, RandomForestClassifier, RandomForestRegressor
 from sklearn.metrics import accuracy_score, mean_absolute_error
 
 from config import ML_MODELS_DIR, ML_MIN_TRAIN_ROWS, ML_RETRAIN_DAYS
@@ -65,6 +65,13 @@ FEATURE_COLS = [
     # Regime features
     "ADX",
     "vol_regime_ratio",
+    # Macro context (VIX)
+    "vix_level",
+    "vix_5d_change",
+    # Earnings event risk
+    "earnings_within_14d",
+    # Mean-reversion signal
+    "price_zscore_20d",
 ]
 
 # GradientBoosting hyper-parameters (conservative — limited data)
@@ -75,6 +82,16 @@ _GB_PARAMS = dict(
     subsample=0.8,
     min_samples_leaf=5,
     random_state=42,
+)
+
+# RandomForest hyper-parameters (ensemble companion to GBM)
+_RF_PARAMS = dict(
+    n_estimators=200,
+    max_depth=5,
+    min_samples_leaf=5,
+    max_features="sqrt",
+    random_state=42,
+    n_jobs=-1,
 )
 
 
@@ -114,8 +131,21 @@ def load_or_train(ticker: str, csv_path: str, force_retrain: bool = False) -> di
     if not force_retrain and _models_are_fresh(models_dir):
         result = _load_models(models_dir)
         if result:
-            result["status"] = "loaded"
-            return result
+            # If the stored feature set no longer matches the current FEATURE_COLS
+            # (e.g. new features were added in a code update), silently retrain so
+            # the user never has to pass --retrain manually after an upgrade.
+            stored_features = set(result.get("features", []))
+            current_features = set(FEATURE_COLS)
+            if not current_features.issubset(stored_features):
+                logger.info(
+                    "Ticker %s: feature set changed (%d stored vs %d current) — retraining.",
+                    ticker,
+                    len(stored_features),
+                    len(current_features),
+                )
+            else:
+                result["status"] = "loaded"
+                return result
 
     return train_models(ticker, csv_path, models_dir)
 
@@ -178,21 +208,55 @@ def train_models(ticker: str, csv_path: str, models_dir: str | None = None) -> d
         y_clf_tr, y_clf_te = y_clf[:split], y_clf[split:]
         y_reg_tr, y_reg_te = y_reg[:split], y_reg[split:]
 
-        # Classifier
-        clf = GradientBoostingClassifier(**_GB_PARAMS)
-        clf.fit(X_tr, y_clf_tr)
-        clf_acc = accuracy_score(y_clf_te, clf.predict(X_te)) if len(X_te) > 0 else float("nan")
+        # Classifier — GBM
+        clf_gb = GradientBoostingClassifier(**_GB_PARAMS)
+        clf_gb.fit(X_tr, y_clf_tr)
 
-        # Regressor
-        reg = GradientBoostingRegressor(**_GB_PARAMS)
-        reg.fit(X_tr, y_reg_tr)
-        reg_mae = mean_absolute_error(y_reg_te, reg.predict(X_te)) if len(X_te) > 0 else float("nan")
+        # Classifier — RandomForest (ensemble companion)
+        clf_rf = RandomForestClassifier(**_RF_PARAMS)
+        clf_rf.fit(X_tr, y_clf_tr)
 
-        models[f"clf_{h}d"]  = clf
-        models[f"reg_{h}d"]  = reg
+        # Ensemble prediction: average probabilities from GBM and RF
+        if len(X_te) > 0:
+            gb_probs = clf_gb.predict_proba(X_te)[:, 1]
+            rf_probs = clf_rf.predict_proba(X_te)[:, 1]
+            ens_probs = (gb_probs + rf_probs) / 2.0
+            ens_preds = (ens_probs >= 0.5).astype(int)
+            clf_acc = accuracy_score(y_clf_te, ens_preds)
+        else:
+            clf_acc = float("nan")
+
+        # Regressor — GBM
+        reg_gb = GradientBoostingRegressor(**_GB_PARAMS)
+        reg_gb.fit(X_tr, y_reg_tr)
+
+        # Regressor — RandomForest (ensemble companion)
+        reg_rf = RandomForestRegressor(**_RF_PARAMS)
+        reg_rf.fit(X_tr, y_reg_tr)
+
+        reg_mae = mean_absolute_error(y_reg_te, reg_gb.predict(X_te)) if len(X_te) > 0 else float("nan")
+
+        models[f"clf_{h}d"]    = clf_gb   # GBM remains primary (for compatibility)
+        models[f"clf_{h}d_rf"] = clf_rf
+        models[f"reg_{h}d"]    = reg_gb
+        models[f"reg_{h}d_rf"] = reg_rf
         metrics[f"clf_{h}d_accuracy"] = round(clf_acc, 4)
         metrics[f"reg_{h}d_mae"]      = round(reg_mae, 6)
         metrics[f"used_cols_{h}d"]    = canonical_cols
+
+        # Feature importances — top 10 GBM features sorted by importance desc
+        importances = clf_gb.feature_importances_
+        top_idx = importances.argsort()[::-1][:10]
+        metrics[f"top_features_clf_{h}d"] = [
+            {"feature": canonical_cols[i], "importance": round(float(importances[i]), 4)}
+            for i in top_idx
+        ]
+        reg_importances = reg_gb.feature_importances_
+        top_reg_idx = reg_importances.argsort()[::-1][:10]
+        metrics[f"top_features_reg_{h}d"] = [
+            {"feature": canonical_cols[i], "importance": round(float(reg_importances[i]), 4)}
+            for i in top_reg_idx
+        ]
 
     # Persist — save canonical_cols (what models were actually trained on)
     _save_models(models_dir, models, canonical_cols, metrics)
@@ -216,6 +280,7 @@ def _save_models(models_dir: str, models: dict, feat_cols: list, metrics: dict) 
         path = os.path.join(models_dir, f"{name}.pkl")
         with open(path, "wb") as f:
             pickle.dump(model, f)
+        logger.debug("Saved model: %s", path)
 
     with open(os.path.join(models_dir, "features.json"), "w") as f:
         json.dump(feat_cols, f)
@@ -226,6 +291,7 @@ def _save_models(models_dir: str, models: dict, feat_cols: list, metrics: dict) 
 
 def _load_models(models_dir: str) -> dict | None:
     expected = ["clf_5d", "clf_21d", "reg_5d", "reg_21d"]
+    rf_optional = ["clf_5d_rf", "clf_21d_rf", "reg_5d_rf", "reg_21d_rf"]
     models = {}
     for name in expected:
         path = os.path.join(models_dir, f"{name}.pkl")
@@ -236,6 +302,15 @@ def _load_models(models_dir: str) -> dict | None:
                 models[name] = pickle.load(f)
         except Exception:
             return None
+    # Load RF companions if available (non-fatal if absent for backward compat)
+    for name in rf_optional:
+        path = os.path.join(models_dir, f"{name}.pkl")
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    models[name] = pickle.load(f)
+            except Exception:
+                pass
 
     feats_path   = os.path.join(models_dir, "features.json")
     metrics_path = os.path.join(models_dir, "metrics.json")

@@ -35,8 +35,14 @@ def _get_spy_data() -> pd.DataFrame:
     """Return cached SPY price history, downloading it at most once."""
     global _spy_cache
     if _spy_cache is None:
-        _spy_cache = yf.download(BENCHMARK_TICKER, period="1y",
-                                  auto_adjust=True, progress=False)
+        spy = yf.download(BENCHMARK_TICKER, period="1y",
+                          auto_adjust=True, progress=False)
+        # Recent yfinance returns MultiIndex columns (field, ticker) even for a
+        # single symbol. Flatten to the field level so `spy["Close"]` is a
+        # Series, not a 1-column DataFrame (which breaks the Beta covariance).
+        if isinstance(spy.columns, pd.MultiIndex):
+            spy.columns = spy.columns.get_level_values(0)
+        _spy_cache = spy
     return _spy_cache
 
 

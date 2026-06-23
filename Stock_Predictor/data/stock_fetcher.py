@@ -123,6 +123,39 @@ def fetch_stock_data(ticker: str) -> tuple[pd.DataFrame, dict]:
     return price_df, info
 
 
+def fetch_vix_data(start: str, end: str) -> "pd.Series":
+    """
+    Download daily VIX close prices for the date range [start, end).
+
+    Parameters
+    ----------
+    start : str  ISO date string, e.g. "2021-06-01"
+    end   : str  ISO date string, exclusive upper bound
+
+    Returns
+    -------
+    pd.Series indexed by date (DatetimeIndex, tz-naive), values = VIX close.
+    Returns an empty Series on any failure so callers degrade gracefully.
+    """
+    try:
+        # NOTE: `show_errors` was removed in recent yfinance versions and now
+        # raises TypeError if passed, which previously zeroed the VIX feature
+        # silently. Omit it and rely on the empty-DataFrame check + try/except.
+        df = yf.download("^VIX", start=start, end=end, auto_adjust=True,
+                         progress=False)
+        if df.empty:
+            return pd.Series(dtype=float)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        series = df["Close"].copy()
+        series.index = pd.to_datetime(series.index)
+        if series.index.tz is not None:
+            series.index = series.index.tz_convert(None)
+        return series
+    except Exception:
+        return pd.Series(dtype=float)
+
+
 def fetch_options_data(ticker: str) -> dict:
     """
     Fetch near-term options data for *ticker* via yfinance.

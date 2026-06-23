@@ -63,6 +63,7 @@ returns a placeholder result so the rest of the program continues.
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from json_repair import repair_json
 from openai import AzureOpenAI, OpenAI
 from google import genai
@@ -1078,8 +1079,13 @@ def _build_judge_prompt(
         f"  - TARGET CONSISTENCY: if majority of LT targets < ${price} -> overall_long_term=NOT_WORTH_INVESTING.\n"
         f"  - CRITICAL: ALL 8 target_prices MUST be populated with float values (no nulls).\n\n"
         f"ACCURACY_PCT COMPUTATION (per horizon -- include in each target_prices entry):\n"
-        f"  Base from ML: 5d clf accuracy={acc_5d_str}, 21d clf accuracy={acc_21d_str}.\n"
-        f"  Apply horizon decay: 1W=1.0, 2W=0.95, 3W=0.90, 1M=0.85, 3M=0.75, 6M=0.65, 9M=0.60, 12M=0.55.\n"
+        f"  PREFERRED BASE: if the HISTORICAL ACCURACY block below reports a realized\n"
+        f"    Directional Accuracy for a horizon (N >= 5 predictions), use THAT realized\n"
+        f"    accuracy as the base for that horizon -- it reflects how this system has\n"
+        f"    actually performed, which beats any theoretical estimate.\n"
+        f"  FALLBACK BASE (no track record): ML clf accuracy 5d={acc_5d_str}, 21d={acc_21d_str},\n"
+        f"    then apply horizon decay: 1W=1.0, 2W=0.95, 3W=0.90, 1M=0.85, 3M=0.75,\n"
+        f"    6M=0.65, 9M=0.60, 12M=0.55.\n"
         f"  Signal agreement bonus: (agreed_signals / total_signals - 0.5) x 10%.\n"
         f"  VIX penalty: HIGH_FEAR=-5%, ELEVATED=-2%, CALM=0%.\n"
         f"  Clamp final accuracy_pct to range [30%, 85%].\n\n"
@@ -1297,9 +1303,18 @@ def _fallback_portfolio_risk() -> dict:
     }
 
 def _error_result(msg: str) -> dict:
+    """
+    Return a safe placeholder result when all LLM providers fail.
+
+    Uses "HOLD" rather than "ERROR" so that the feedback tracker
+    can record a valid recommendation and the feedback loop can
+    accumulate directional accuracy data even on failed LLM runs.
+    The ``llm_available=False`` flag is the authoritative signal
+    that no LLM output was produced.
+    """
     return {
         "llm_available":      False,
-        "recommendation":     "ERROR",
+        "recommendation":     "HOLD",
         "confidence":         "LOW",
         "overall_short_term": "NEUTRAL",
         "overall_long_term":  "NEUTRAL",
@@ -1527,12 +1542,23 @@ def _extract_json(raw: str) -> dict:
 # Azure OpenAI call
 # ================================================================== #
 
-def _call_azure(prompt: str) -> dict:
-    client = AzureOpenAI(
+@lru_cache(maxsize=1)
+def _get_azure_client() -> AzureOpenAI:
+    """Build the Azure client once and reuse it across all agent calls.
+
+    The 13-agent chain (and each configured provider) issues many requests
+    per run; the OpenAI/Azure SDK client is thread-safe and pools HTTP
+    connections, so constructing it once avoids redundant setup overhead.
+    """
+    return AzureOpenAI(
         api_key        = AZURE_OPENAI_KEY,
         azure_endpoint = AZURE_OPENAI_ENDPOINT,
         api_version    = AZURE_OPENAI_API_VERSION,
     )
+
+
+def _call_azure(prompt: str) -> dict:
+    client = _get_azure_client()
     response = client.chat.completions.create(
         model      = AZURE_OPENAI_DEPLOYMENT,
         messages   = [
@@ -1559,8 +1585,14 @@ def _call_azure(prompt: str) -> dict:
 # Google Gemini call
 # ================================================================== #
 
+@lru_cache(maxsize=1)
+def _get_google_client() -> "genai.Client":
+    """Build the Gemini client once and reuse it across all agent calls."""
+    return genai.Client(api_key=GOOGLE_API_KEY)
+
+
 def _call_google(prompt: str) -> dict:
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    client = _get_google_client()
     response = client.models.generate_content(
         model   = GOOGLE_MODEL,
         contents= prompt,
@@ -1590,11 +1622,17 @@ def _call_google(prompt: str) -> dict:
 # DeepSeek call (OpenAI-compatible)
 # ================================================================== #
 
-def _call_deepseek(prompt: str) -> dict:
-    client = OpenAI(
+@lru_cache(maxsize=1)
+def _get_deepseek_client() -> OpenAI:
+    """Build the DeepSeek (OpenAI-compatible) client once and reuse it."""
+    return OpenAI(
         api_key  = DEEPSEEK_API_KEY,
         base_url = DEEPSEEK_BASE_URL,
     )
+
+
+def _call_deepseek(prompt: str) -> dict:
+    client = _get_deepseek_client()
     response = client.chat.completions.create(
         model      = DEEPSEEK_MODEL,
         messages   = [
@@ -1705,65 +1743,58 @@ def get_llm_analysis(
             "description":        description,
         }
 
-    providers_result = {}
-    primary_result   = None
-
-    # -- Azure OpenAI ------------------------------------------
+    # Build the list of configured providers in priority order. The first
+    # successful provider in this order becomes the primary (displayed) result.
+    provider_specs = []
     if AZURE_ENABLED:
-        try:
-            azure_chain = _run_agent_chain(
-                _call_azure, ticker, info, technical, fundamental,
-                statistical, analyst_data, ml_result,
-                accuracy_context=_ctx("Azure OpenAI"),
-            )
-            azure_chain["llm_available"] = True
-            azure_chain["_provider"]     = "Azure OpenAI"
-            providers_result["Azure OpenAI"] = azure_chain
-            primary_result = azure_chain
-        except Exception as e:
-            providers_result["Azure OpenAI"] = _error_result(f"Azure OpenAI error: {e}")
-
-    # -- Google Gemini -----------------------------------------
+        provider_specs.append(("Azure OpenAI", _call_azure))
     if GOOGLE_ENABLED:
-        try:
-            google_chain = _run_agent_chain(
-                _call_google, ticker, info, technical, fundamental,
-                statistical, analyst_data, ml_result,
-                accuracy_context=_ctx(f"Google Gemini ({GOOGLE_MODEL})"),
-            )
-            google_chain["llm_available"] = True
-            google_chain["_provider"]     = f"Google Gemini ({GOOGLE_MODEL})"
-            providers_result[f"Google Gemini ({GOOGLE_MODEL})"] = google_chain
-            if primary_result is None:
-                primary_result = google_chain
-        except Exception as e:
-            providers_result[f"Google Gemini ({GOOGLE_MODEL})"] = _error_result(
-                f"Google Gemini error: {e}"
-            )
-
-    # -- DeepSeek ----------------------------------------------
+        provider_specs.append((f"Google Gemini ({GOOGLE_MODEL})", _call_google))
     if DEEPSEEK_ENABLED:
+        provider_specs.append((f"DeepSeek ({DEEPSEEK_MODEL})", _call_deepseek))
+
+    def _run_provider(pname: str, call_fn) -> dict:
+        """Run one provider's full 13-agent chain. Never raises."""
         try:
-            deepseek_chain = _run_agent_chain(
-                _call_deepseek, ticker, info, technical, fundamental,
+            chain = _run_agent_chain(
+                call_fn, ticker, info, technical, fundamental,
                 statistical, analyst_data, ml_result,
-                accuracy_context=_ctx(f"DeepSeek ({DEEPSEEK_MODEL})"),
+                accuracy_context=_ctx(pname),
             )
-            deepseek_chain["llm_available"] = True
-            deepseek_chain["_provider"]     = f"DeepSeek ({DEEPSEEK_MODEL})"
-            providers_result[f"DeepSeek ({DEEPSEEK_MODEL})"] = deepseek_chain
-            if primary_result is None:
-                primary_result = deepseek_chain
+            chain["llm_available"] = True
+            chain["_provider"]     = pname
+            return chain
         except Exception as e:
-            providers_result[f"DeepSeek ({DEEPSEEK_MODEL})"] = _error_result(
-                f"DeepSeek error: {e}"
-            )
+            return _error_result(f"{pname} error: {e}")
+
+    # Run every provider chain concurrently — they are fully independent,
+    # so wall-clock collapses to the slowest single provider rather than
+    # the sum of all providers. Each chain still parallelises its own agents.
+    providers_result = {}
+    if provider_specs:
+        with ThreadPoolExecutor(max_workers=len(provider_specs)) as ex:
+            futures = {
+                ex.submit(_run_provider, pname, fn): pname
+                for pname, fn in provider_specs
+            }
+            for fut in futures:
+                pname = futures[fut]
+                providers_result[pname] = fut.result()
+
+    # Select the primary result: first provider (in priority order) that
+    # actually produced LLM output.
+    primary_result = None
+    for pname, _ in provider_specs:
+        result = providers_result.get(pname)
+        if result and result.get("llm_available", False):
+            primary_result = result
+            break
 
     if primary_result is None:
         err_msg = " | ".join(
             r.get("summary", "Unknown error")
             for r in providers_result.values()
-            if r.get("recommendation") == "ERROR"
+            if not r.get("llm_available", False)
         )
         return _error_result(f"All LLM providers failed: {err_msg}")
 
@@ -1775,7 +1806,7 @@ def get_llm_analysis(
     try:
         from feedback.accuracy import apply_bias_correction
         for pname, presult in providers_result.items():
-            if presult.get("recommendation") == "ERROR":
+            if not presult.get("llm_available", False):
                 continue
             pctx = _ctx(pname) or {}
             if pctx.get("has_data"):

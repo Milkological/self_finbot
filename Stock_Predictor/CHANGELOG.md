@@ -5,6 +5,163 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) co
 
 ---
 
+## [1.3.0] — 2026-06-24
+
+This release **repairs and grounds the feedback loop**, **speeds up the LLM pipeline**, and
+makes the **terminal display and report far easier to read**. Each item below states *what*
+changed, *why*, and *how it improves things*.
+
+### Fixed
+
+#### Feedback resolver was silently dead on modern yfinance (`feedback/resolver.py`)
+- **What:** `_fetch_price_on_or_before()` called `yf.download(..., show_errors=False)`. That
+  keyword was removed from current yfinance, so the call raised `TypeError`, which the bare
+  `except` swallowed — the function always returned `None`.
+- **Why it mattered:** *no live prediction ever resolved*, so accuracy stats, bias correction,
+  dynamic lens weights, and ML calibration never activated. The whole learning loop was inert.
+- **Improvement:** kwarg removed; the loop accumulates real outcomes again. Verified live —
+  a single `--resolve KEEL` settled **247** previously-stuck outcomes.
+
+#### Resolver: batched, pandas-3-safe rewrite (`feedback/resolver.py`)
+- **What:** resolution now downloads each ticker's price history **once** and resolves every
+  row/horizon from that in-memory series (was one `yf.download` *per horizon per row* — up to
+  ~2,000 calls for a 250-row CSV). CSV is read as object dtype (`keep_default_na=False` +
+  `astype(object)`) so outcome writes no longer hit pandas ≥ 3's strict StringDtype.
+- **Improvement:** ~100× fewer network calls per resolve pass; resolution works on pandas ≥ 3.
+
+#### Calibration no longer dies on imperfect CSVs (`feedback/accuracy.py`)
+- **What:** `build_calibration_table()` used a plain `read_csv` that threw on CSVs containing a
+  single malformed row (the "Expected 72 fields, saw 73" corruption seen in some feedback files).
+- **Improvement:** reads with `on_bad_lines="skip"` like the rest of the module, so calibration
+  builds for **every** ticker, not just pristine ones.
+
+#### Data fetch robustness (`data/stock_fetcher.py`, `analysis/statistical.py`)
+- **What:** removed the same removed-kwarg `show_errors=False` from `fetch_vix_data()` (it was
+  silently zeroing the VIX feature); `_get_spy_data()` now flattens MultiIndex columns.
+- **Improvement:** the VIX features populate, and Beta no longer silently fails on yfinance
+  versions that return MultiIndex columns for a single symbol.
+
+#### Dead error-branch in the LLM orchestrator (`analysis/llm_analysis.py`)
+- **What:** `get_llm_analysis()` checked `recommendation == "ERROR"`, but `_error_result()`
+  returns `"HOLD"` — so the failed-provider summary was always empty and bias correction could
+  be applied to failed providers. Now keys off the authoritative `llm_available` flag.
+
+#### Test isolation + platform fixes
+- **`tests/test_feedback_tracker.py`:** removed an `importlib.reload()` that re-ran
+  `from config import FEEDBACK_DIR` and defeated the `patch(...)`, causing tests to write to the
+  **real** `feedback/` directory and depend on accumulated rows. Tests are now hermetic.
+- **`main.py`:** forces UTF-8 on stdout/stderr at startup — fixes `UnicodeEncodeError` for
+  symbols like σ/β when the console or a pipe defaults to cp1252 on Windows.
+- **Repo hygiene:** untracked 18 `.pyc` files that had been committed before `.gitignore` existed.
+
+### Changed
+
+#### LLM pipeline: concurrent providers + reused clients (`analysis/llm_analysis.py`)
+- **What:** the Azure / Gemini / DeepSeek chains now run **concurrently** in a
+  `ThreadPoolExecutor` (each chain still parallelises its own 13 agents). Each provider's API
+  client is constructed **once** via `lru_cache` (`_get_azure_client` / `_get_google_client` /
+  `_get_deepseek_client`) instead of on every agent call.
+- **Why:** the chains are independent and the SDK clients are thread-safe and pool connections.
+- **Improvement:** wall-clock ≈ the *slowest single provider* instead of the *sum* of all
+  providers; far fewer redundant client constructions per run.
+
+#### Bias correction: median + sample shrinkage (`feedback/accuracy.py`)
+- **What:** per-horizon bias now uses the **median** signed error, and the correction is
+  **shrunk** toward 1.0 on thin data:
+  `1 + clamp(median_bias/100, ±FEEDBACK_MAX_BIAS_CORRECTION) × min(1, N / (2·FEEDBACK_MIN_SAMPLES))`.
+- **Why:** the mean let one volatile-horizon outlier swing every future target; small samples
+  over-corrected.
+- **Improvement:** corrections are robust to outliers and ramp in gradually as evidence grows.
+
+#### The Judge is grounded in *realized* accuracy (`feedback/accuracy.py`, `analysis/llm_analysis.py`)
+- **What:** `format_llm_injection()` now instructs the Judge to use each horizon's **realized
+  directional accuracy** as the base for its `accuracy_pct` when N ≥ `FEEDBACK_MIN_SAMPLES`
+  (falling back to the ML-test-split × decay × VIX heuristic only when there is no track record),
+  and adds caution rules: rec-hit-rate < 50% caps confidence at MEDIUM, < 40% caps at LOW, and
+  sub-coin-flip horizons are flagged. `_build_judge_prompt()`'s ACCURACY_PCT block was updated to
+  match.
+- **Improvement:** stated confidence/accuracy reflect how FinBot has *actually* performed and
+  self-correct as resolved data accumulates, instead of being persistently over-confident.
+
+#### Display & report readability (`output/terminal_display.py`, `output/report_generator.py`)
+- **What:** the terminal now opens with a bottom-line-up-front **Executive Summary** panel
+  (recommendation, confidence, price → key target, ST/LT outlook, ML cross-check, top bull/risk),
+  and every analysis domain has its **own accent colour** via shared `_section()` / `_std_table()`
+  helpers. The Markdown report leads with an **Executive Summary** table and a **Contents** TOC.
+- **Improvement:** the verdict is the first thing you see, and sections are distinguishable at a
+  glance instead of a uniform cyan/magenta wall.
+
+### Added
+
+#### Tests (`tests/test_resolver.py`, `tests/test_accuracy.py`)
+- First unit coverage for the resolver and accuracy modules: single batched fetch, no
+  `show_errors` kwarg, outcome/directional math, unelapsed-horizon handling, median+shrinkage
+  correction math, calibration robustness to malformed rows, and the grounded/caution injection.
+- Suite grew from 176 → **191 tests**, all green.
+
+---
+
+## [1.2.0] — 2026-06-22
+
+### Added
+
+#### Feedback Loop — Historical Backfill (`feedback/backfiller.py`)
+- New module `feedback/backfiller.py` solving the feedback cold-start problem.
+- `backfill_historical_predictions(ticker, trainer_result, features_csv, price_df)` — replays trained models across the **test split** (last 20% of labelled rows in `features.csv`) to immediately generate resolved feedback rows without waiting for real runs to accumulate.  Only out-of-sample rows are used to avoid measuring in-sample performance.
+- For each test-split row on date D the function: builds the feature vector, runs all 4 GBM + 4 RF models, looks ahead in `price_df` to resolve actual prices at all 8 horizons (1W=5 biz days … 12M=252 biz days), computes `dir_correct_{h}`, `ml_5d_correct`, and `ml_21d_correct`, then appends a fully-resolved row tagged `mode="backfill"`, `provider="backfill"` to the feedback CSV.
+- `needs_backfill(ticker)` — returns True when the feedback CSV has fewer resolved rows than `FEEDBACK_MIN_SAMPLES`. Used as the auto-trigger gate inside `run_pipeline()`.
+- Deduplication by `run_date` prevents double-writing if `--backfill` is run more than once.
+- **What backfill provides:** ML accuracy calibration, all-horizon directional accuracy stats, adjusted lens weights (N≥5). **What it cannot provide:** LLM price target bias (`pct_error`) — no historical LLM outputs exist, so `correction_factor` still requires real LLM runs.
+
+#### Feedback Loop — ML Probability Calibration (`feedback/accuracy.py`)
+- `build_calibration_table(ticker)` — buckets resolved `ml_Xd_prob_up` values into ranges `[0.0–0.3, 0.3–0.4, …, 0.8–1.0]`, computes empirical direction-accuracy per bucket, and saves the result to `models/{TICKER}/calibration.json`. Activated when resolved rows ≥ `CALIBRATION_MIN_SAMPLES` (default 10). Called automatically after backfill and after each pipeline run that triggers backfill.
+
+#### ML — GradientBoosting + RandomForest Ensemble (`ml/trainer.py`, `ml/predictor.py`)
+- `ml/trainer.py`: each horizon (5d, 21d) now trains **two** classifier/regressor pairs — `GradientBoostingClassifier` (existing, primary) and a new `RandomForestClassifier` companion. Same for regressors. RF hyper-parameters: `n_estimators=200`, `max_depth=5`, `min_samples_leaf=5`, `max_features="sqrt"`. Models saved as `clf_{h}d_rf.pkl` and `reg_{h}d_rf.pkl`.
+- `ml/predictor.py`: ensemble inference — raw `predict_proba` probabilities from GBM and RF are averaged; the averaged value is used as `clf_{h}d_prob_up`. Ensemble averaging reduces variance and gives more stable signals.
+- `ml/predictor.py`: **calibrated probability** — after raw ensemble probability is computed, `_apply_calibration()` looks up `models/{TICKER}/calibration.json`; if the bucket exists the empirical accuracy replaces the raw prob as `clf_{h}d_prob_up_cal`. Falls back to raw prob when calibration is unavailable.
+- `ml/predictor.py`: **confidence labels** — `clf_{h}d_confidence` set to `"HIGH"` when `|calibrated_prob − 0.5| > 0.20`, `"MEDIUM"` when `> 0.10`, `"LOW"` otherwise.
+- `ml/trainer.py`: **feature importances** — top-10 GBM `feature_importances_` (sorted descending) saved to `metrics.json` as `top_features_clf_5d`, `top_features_clf_21d`, `top_features_reg_5d`, `top_features_reg_21d`.
+- `_load_models()` updated to load RF companions when present; silently skips them when absent (backward compatibility with existing `*.pkl` files from v1.1).
+
+#### ML — 4 New Features (`data/csv_exporter.py`, `ml/trainer.py`)
+- **`vix_level`** — daily VIX close joined to the price DataFrame by date. Provides macro fear-regime context missing from all previous feature sets. Source: `^VIX` via yfinance (fully historical, no limitations).
+- **`vix_5d_change`** — 5-day percentage change in VIX; captures whether fear is rising or falling at prediction time.
+- **`earnings_within_14d`** — binary flag (1/0); 1 if the row's date is within 14 calendar days of any earnings announcement. Derived from `yf.Ticker.get_earnings_dates(limit=20)`. Earnings proximity is one of the strongest disruptors of technical patterns.
+- **`price_zscore_20d`** — `(Close − SMA_20) / rolling_std_20`. A mean-reversion signal orthogonal to Bollinger %B (which normalises by bandwidth rather than standard deviation). Pure OHLCV computation; no new data source required.
+- All 4 features added to `FEATURE_COLS` in `ml/trainer.py`, bringing the total feature count from 29 → 33.
+
+#### Data — VIX Fetch (`data/stock_fetcher.py`)
+- `fetch_vix_data(start, end)` — downloads daily `^VIX` close prices for a given date range via yfinance. Returns a tz-naive `pd.Series` indexed by date. Returns an empty Series on any failure so callers degrade gracefully.
+
+#### CLI — `--backfill` Flag (`main.py`)
+- New `--backfill` argument — resolves historically by running the trained model over test-split data and writing resolved feedback rows, then exits. Accepts `--ticker`, `--file`, or falls back to `tickers.txt`.
+- `run_pipeline()` auto-triggers backfill (once) when `needs_backfill(ticker)` is True after ML training, then calls `build_calibration_table()` to immediately activate calibration.
+
+#### Config — New Keys (`config.py`)
+- `BACKFILL_MIN_TEST_ROWS` (default `20`, env: `BACKFILL_MIN_TEST_ROWS`) — minimum test-split rows required before backfill writes rows. Prevents writing noise on very thin datasets.
+- `CALIBRATION_MIN_SAMPLES` (default `10`, env: `CALIBRATION_MIN_SAMPLES`) — minimum resolved rows before the ML probability calibration table is built.
+
+### Changed
+
+#### Data — Extended Training History (`config.py`, `data/stock_fetcher.py`)
+- `HISTORY_PERIOD` changed from `"2y"` to `"5y"` — approximately 2.5× more training data (~1,250 daily rows vs ~500). This is the single highest-ROI change for ML accuracy: more data improves generalisation, reduces overfitting on short-period patterns, and allows the test split to provide ~250 genuinely out-of-sample rows for backfill.
+- All downstream consumers (csv_exporter, ML trainer, statistical models) automatically benefit; no other code changes required.
+
+#### Analysis — Monte Carlo Simulation (`config.py`)
+- `MONTE_CARLO_PATHS` increased from `1000` to `2500`. Tighter confidence intervals at 5th/95th percentiles with minimal additional runtime (~150ms on modern hardware).
+
+#### LLM — Error Result No Longer Returns "ERROR" Recommendation (`analysis/llm_analysis.py`)
+- `_error_result()` now returns `"HOLD"` instead of `"ERROR"` as the `recommendation` field. The authoritative signal for a failed LLM run is `llm_available=False`, not the recommendation string.
+- **Why this matters:** the feedback tracker previously skipped saving rows where `recommendation == "ERROR"`, which silently discarded every failed LLM run from the feedback loop. With `"HOLD"`, these runs are now saved and resolved correctly — directional accuracy for the ML signals and rule-based fallback is captured even when the LLM chain fails.
+- `main.py` feedback-save guard updated to check `presult.get("llm_available", True) == False` instead of `recommendation == "ERROR"`.
+
+#### CSV Exporter — Signature Updated (`data/csv_exporter.py`)
+- `export_features_csv()` and `_build_feature_df()` now accept `ticker: str` as a first parameter (required for earnings-date lookup). All call sites in `main.py` updated accordingly.
+- Forward-return label section renumbered (4 new feature sections inserted before it).
+
+---
+
 ## [1.1.0] — 2026-05-31
 
 ### Added

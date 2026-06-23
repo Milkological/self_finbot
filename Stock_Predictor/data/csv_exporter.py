@@ -14,6 +14,9 @@ last row; all historical rows default to 0.0 / "NEUTRAL".
 import os
 import numpy as np
 import pandas as pd
+import yfinance as yf
+
+from data.stock_fetcher import fetch_vix_data
 
 
 # ------------------------------------------------------------------ #
@@ -47,7 +50,7 @@ def export_features_csv(
     -------
     Absolute path to the saved CSV file.
     """
-    df = _build_feature_df(price_df, technical, info, sentiment)
+    df = _build_feature_df(ticker, price_df, technical, info, sentiment)
     path = os.path.join(dir_path, "features.csv")
     df.to_csv(path)
     return path
@@ -58,6 +61,7 @@ def export_features_csv(
 # ------------------------------------------------------------------ #
 
 def _build_feature_df(
+    ticker: str,
     price_df: pd.DataFrame,
     technical: dict,
     info: dict,
@@ -147,7 +151,56 @@ def _build_feature_df(
             sentiment.get("label", "NEUTRAL")
         )
 
-    # ── 5. Forward-return labels (supervised targets) ───────────── #
+    # ── 5. VIX macro features ────────────────────────────────────── #
+    # Market fear context: vix_level captures current fear regime;
+    # vix_5d_change captures whether fear is rising or falling.
+    try:
+        start_str = feat.index[0].strftime("%Y-%m-%d")
+        end_str   = (feat.index[-1] + pd.Timedelta(days=2)).strftime("%Y-%m-%d")
+        vix_series = fetch_vix_data(start_str, end_str)
+        if not vix_series.empty:
+            vix_series.index = pd.to_datetime(vix_series.index).normalize()
+            feat.index = pd.to_datetime(feat.index).normalize()
+            feat["vix_level"] = vix_series.reindex(feat.index, method="ffill")
+            feat["vix_5d_change"] = feat["vix_level"].pct_change(5)
+        else:
+            feat["vix_level"]    = np.nan
+            feat["vix_5d_change"] = np.nan
+    except Exception:
+        feat["vix_level"]    = np.nan
+        feat["vix_5d_change"] = np.nan
+
+    # ── 6. Earnings proximity flag ───────────────────────────────── #
+    # Binary: 1 if this trading day is within 14 calendar days of an
+    # earnings announcement, 0 otherwise.  Earnings dates are a major
+    # disruptor of technical patterns.
+    feat["earnings_within_14d"] = 0.0
+    try:
+        t = yf.Ticker(ticker)
+        earnings_df = t.get_earnings_dates(limit=20)
+        if earnings_df is not None and not earnings_df.empty:
+            earn_dates = pd.to_datetime(earnings_df.index).normalize()
+            earn_dates_tz_naive = earn_dates.tz_localize(None) if earn_dates.tz is not None else earn_dates
+            feat_dates = pd.to_datetime(feat.index).normalize()
+            if feat_dates.tz is not None:
+                feat_dates = feat_dates.tz_localize(None)
+            for d in feat_dates:
+                diffs = abs((earn_dates_tz_naive - d).days)
+                if diffs.min() <= 14:
+                    feat.at[d, "earnings_within_14d"] = 1.0
+    except Exception:
+        pass  # Non-fatal — defaults to 0
+
+    # ── 7. Price z-score (mean-reversion signal) ─────────────────── #
+    # Captures how stretched price is relative to its recent mean,
+    # independent of Bollinger %B which is range-normalised differently.
+    rolling_std_20 = feat["Close"].rolling(20, min_periods=5).std()
+    feat["price_zscore_20d"] = (
+        (feat["Close"] - feat["Close"].rolling(20, min_periods=5).mean())
+        / rolling_std_20.replace(0, np.nan)
+    )
+
+    # ── 8. Forward-return labels (supervised targets) ───────────── #
     # direction: 1 = price up, 0 = price down or flat
     # return:    raw percentage change
     for h in (5, 21):

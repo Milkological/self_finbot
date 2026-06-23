@@ -30,6 +30,8 @@
 QUBT
 NOW
 ILMN
+DRAM
+KEEL
 
 
 # --- Broad-market ETFs ---

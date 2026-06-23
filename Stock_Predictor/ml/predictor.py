@@ -14,8 +14,6 @@ Expected models (loaded from models/{TICKER}/ by trainer.load_or_train):
 import os
 import json
 import logging
-
-import numpy as np
 import pandas as pd
 
 from ml.trainer import FEATURE_COLS
@@ -73,20 +71,54 @@ def predict(csv_path: str, trainer_result: dict) -> dict:
     }
 
     for h in (5, 21):
-        clf = models.get(f"clf_{h}d")
-        reg = models.get(f"reg_{h}d")
+        clf_gb = models.get(f"clf_{h}d")
+        clf_rf = models.get(f"clf_{h}d_rf")
+        reg_gb = models.get(f"reg_{h}d")
+        reg_rf = models.get(f"reg_{h}d_rf")
 
-        if clf is not None:
-            prob_up = float(clf.predict_proba(x)[0][1])
+        if clf_gb is not None:
+            prob_gb = float(clf_gb.predict_proba(x)[0][1])
+            # Average with RF ensemble if available
+            if clf_rf is not None:
+                prob_rf  = float(clf_rf.predict_proba(x)[0][1])
+                prob_up  = round((prob_gb + prob_rf) / 2.0, 4)
+            else:
+                prob_up  = round(prob_gb, 4)
+
             direction = "UP" if prob_up >= 0.5 else "DOWN"
-            result[f"clf_{h}d_prob_up"]   = round(prob_up, 4)
-            result[f"clf_{h}d_direction"] = direction
-        else:
-            result[f"clf_{h}d_prob_up"]   = None
-            result[f"clf_{h}d_direction"] = "N/A"
 
-        if reg is not None:
-            ret_pct = float(reg.predict(x)[0]) * 100
+            # Calibrate using empirical lookup table if it exists
+            cal_path = os.path.join(os.path.dirname(csv_path), "..", "..", "models",
+                                    os.path.basename(os.path.dirname(csv_path)), "calibration.json")
+            cal_path = os.path.normpath(cal_path)
+            cal_prob_up = _apply_calibration(prob_up, cal_path, h)
+
+            # Confidence label based on distance from the decision boundary
+            confidence_margin = abs(cal_prob_up - 0.5)
+            if confidence_margin > 0.20:
+                confidence = "HIGH"
+            elif confidence_margin > 0.10:
+                confidence = "MEDIUM"
+            else:
+                confidence = "LOW"
+
+            result[f"clf_{h}d_prob_up"]         = prob_up
+            result[f"clf_{h}d_prob_up_cal"]     = round(cal_prob_up, 4)
+            result[f"clf_{h}d_direction"]       = direction
+            result[f"clf_{h}d_confidence"]      = confidence
+        else:
+            result[f"clf_{h}d_prob_up"]         = None
+            result[f"clf_{h}d_prob_up_cal"]     = None
+            result[f"clf_{h}d_direction"]       = "N/A"
+            result[f"clf_{h}d_confidence"]      = "N/A"
+
+        if reg_gb is not None:
+            ret_gb = float(reg_gb.predict(x)[0]) * 100
+            if reg_rf is not None:
+                ret_rf = float(reg_rf.predict(x)[0]) * 100
+                ret_pct = (ret_gb + ret_rf) / 2.0
+            else:
+                ret_pct = ret_gb
             result[f"reg_{h}d_return_pct"] = round(ret_pct, 2)
         else:
             result[f"reg_{h}d_return_pct"] = None
@@ -97,6 +129,33 @@ def predict(csv_path: str, trainer_result: dict) -> dict:
 # ------------------------------------------------------------------ #
 # Internal helpers
 # ------------------------------------------------------------------ #
+
+def _apply_calibration(raw_prob: float, cal_path: str, horizon: int) -> float:
+    """
+    Look up the calibrated probability for ``raw_prob`` from
+    ``calibration.json`` if it exists.  Falls back to ``raw_prob``
+    when the file is absent or the lookup fails.
+
+    calibration.json format (written by feedback/accuracy.py):
+        {
+          "5d":  [{"lo": 0.3, "hi": 0.4, "empirical": 0.42}, ...],
+          "21d": [...]
+        }
+    """
+    try:
+        if not os.path.isfile(cal_path):
+            return raw_prob
+        with open(cal_path) as f:
+            cal = json.load(f)
+        key = f"{horizon}d"
+        buckets = cal.get(key, [])
+        for b in buckets:
+            if b["lo"] <= raw_prob < b["hi"]:
+                return float(b["empirical"])
+    except Exception:
+        pass
+    return raw_prob
+
 
 def _build_feature_vector(csv_path: str, feature_cols: list) -> "np.ndarray | None":
     """Read the last non-NaN feature row and return a (1, n_features) array."""
@@ -123,13 +182,17 @@ def _build_feature_vector(csv_path: str, feature_cols: list) -> "np.ndarray | No
 
 def _empty(status: str) -> dict:
     return {
-        "clf_5d_prob_up":     None,
-        "clf_21d_prob_up":    None,
-        "clf_5d_direction":   "N/A",
-        "clf_21d_direction":  "N/A",
-        "reg_5d_return_pct":  None,
-        "reg_21d_return_pct": None,
-        "metrics":            {},
-        "trained_on_rows":    0,
-        "status":             status,
+        "clf_5d_prob_up":       None,
+        "clf_5d_prob_up_cal":   None,
+        "clf_21d_prob_up":      None,
+        "clf_21d_prob_up_cal":  None,
+        "clf_5d_direction":     "N/A",
+        "clf_21d_direction":    "N/A",
+        "clf_5d_confidence":    "N/A",
+        "clf_21d_confidence":   "N/A",
+        "reg_5d_return_pct":    None,
+        "reg_21d_return_pct":   None,
+        "metrics":              {},
+        "trained_on_rows":      0,
+        "status":               status,
     }

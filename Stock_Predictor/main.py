@@ -23,6 +23,18 @@ import os
 import sys
 import time
 
+# ------------------------------------------------------------------ #
+# Force UTF-8 stdout/stderr so unicode symbols in the report (σ, β, …)
+# never crash on Windows, where the console / a piped stream defaults
+# to cp1252 and raises UnicodeEncodeError. Guarded for older Pythons
+# and streams that don't expose reconfigure().
+# ------------------------------------------------------------------ #
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass
+
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 
@@ -43,8 +55,9 @@ from data.sentiment_fetcher import score_headlines
 from ml.trainer    import load_or_train
 from ml.predictor  import predict as ml_predict
 from feedback.resolver import resolve_pending
-from feedback.accuracy import get_context as get_accuracy_context
+from feedback.accuracy import get_context as get_accuracy_context, build_calibration_table
 from feedback.tracker  import save_prediction as save_feedback
+from feedback.backfiller import backfill_historical_predictions, needs_backfill
 
 console = Console()
 
@@ -101,6 +114,15 @@ def parse_args() -> argparse.Namespace:
         help    = (
             "Resolve pending predictions in feedback CSVs (fetch actual prices) "
             "and exit without running a full analysis."
+        ),
+    )
+    parser.add_argument(
+        "--backfill",
+        action  = "store_true",
+        default = False,
+        help    = (
+            "Backfill historical predictions from features.csv test split "
+            "into the feedback CSV to bootstrap accuracy statistics, then exit."
         ),
     )
     return parser.parse_args()
@@ -246,6 +268,24 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
             }
         progress.advance(task)
 
+        # ── Auto-backfill: bootstrap feedback loop if insufficient resolved rows ─ #
+        # Runs once per ticker (after ML training) when the feedback CSV is thin.
+        # Uses test-split rows from features.csv so no data leakage occurs.
+        try:
+            if trainer_result and needs_backfill(ticker):
+                bf_count = backfill_historical_predictions(
+                    ticker, trainer_result, csv_path, price_df
+                )
+                if bf_count > 0:
+                    console.log(
+                        f"[dim]Feedback backfill: wrote {bf_count} historical rows for {ticker} "
+                        f"(test-split replay — bootstrapping accuracy stats).[/dim]"
+                    )
+                    # Rebuild calibration table now that we have more resolved rows
+                    build_calibration_table(ticker)
+        except Exception as bf_err:
+            console.log(f"[dim yellow]Backfill error (non-fatal): {bf_err}[/dim yellow]")
+
         # Step 7 — LLM Analysis (ml_result passed so Judge can use ML signals)
         progress.update(task, description=f"[7/{len(steps)}] {steps[6]}")
         if skip_llm or not LLM_ENABLED:
@@ -349,7 +389,8 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
     try:
         if mode_str == "llm" and llm_result.get("providers"):
             for pname, presult in llm_result["providers"].items():
-                if presult.get("recommendation") == "ERROR":
+                # Skip providers that failed entirely (no LLM output produced)
+                if not presult.get("llm_available", True):
                     continue
                 save_feedback(
                     ticker       = ticker,
@@ -471,6 +512,57 @@ if __name__ == "__main__":
             console.print(f"  [{colour}]{t:>10}[/{colour}]  {n} outcome(s) resolved")
             total += n
         console.print(f"\n[bold green]Done.[/bold green] {total} total outcome(s) resolved across all tickers.\n")
+        sys.exit(0)
+
+    # ── --backfill mode: bootstrap feedback from features.csv ──── #
+    if args.backfill:
+        target_tickers: list[str] = []
+        if args.ticker:
+            target_tickers = [args.ticker.upper().strip()]
+        elif args.file:
+            target_tickers = _read_tickers_file(args.file)
+        else:
+            default_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tickers.txt")
+            if os.path.isfile(default_file):
+                target_tickers = _read_tickers_file(default_file)
+
+        if not target_tickers:
+            console.print("[yellow]No tickers to backfill.[/yellow]")
+            sys.exit(0)
+
+        from feedback.backfiller import backfill_historical_predictions as _backfill
+        from data.stock_fetcher import fetch_stock_data as _fetch
+        from ml.trainer import load_or_train as _load_or_train
+        import glob
+
+        console.print(f"\n[bold cyan]FinBot — Backfilling feedback for {len(target_tickers)} ticker(s)[/bold cyan]\n")
+        total_bf = 0
+        for t in target_tickers:
+            try:
+                # Find the most recent features.csv for this ticker
+                pattern = os.path.join("reports", f"{t}_*", "features.csv")
+                candidates = sorted(glob.glob(pattern))
+                if not candidates:
+                    console.print(f"  [yellow]{t:>10}[/yellow]  no features.csv found — run a normal analysis first")
+                    continue
+                csv_path = candidates[-1]
+
+                # Load price history and models
+                price_df, _ = _fetch(t)
+                trainer_result = _load_or_train(t, csv_path)
+                if trainer_result.get("status") == "insufficient_data":
+                    console.print(f"  [yellow]{t:>10}[/yellow]  insufficient training data")
+                    continue
+
+                n = _backfill(t, trainer_result, csv_path, price_df)
+                build_calibration_table(t)
+                colour = "green" if n > 0 else "dim"
+                console.print(f"  [{colour}]{t:>10}[/{colour}]  {n} historical row(s) backfilled")
+                total_bf += n
+            except Exception as e:
+                console.print(f"  [red]{t}[/red]: error — {e}")
+                continue
+        console.print(f"\n[bold green]Done.[/bold green] {total_bf} total row(s) backfilled.\n")
         sys.exit(0)
 
     if args.ticker:
