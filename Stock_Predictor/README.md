@@ -202,7 +202,45 @@ python main.py --ticker SPY --backfill
 python main.py --file tickers.txt --backfill
 ```
 
-`--backfill` only uses the **last 20% (test split)** of `features.csv` — data the model was never trained on — so there is no look-ahead bias. Backfill rows are tagged `provider="backfill"` in the CSV.
+`--backfill` replays the **last 20%** of `features.csv` using temporary models fitted only on the first 80%, so the replayed window is genuinely out-of-sample and there is no look-ahead bias. Backfill rows are tagged `provider="backfill"` in the CSV.
+
+### Step 5 — Discover new tickers (`--discover`)
+
+Scans the market for fresh candidates using four free, key-less sources:
+
+1. **yfinance predefined screeners** — day gainers, most actives, small-cap gainers, undervalued growth, growth tech.
+2. **Volume-spike scan** — every NASDAQ/NYSE common stock whose volume is >3× its 20-day average with positive 5-day momentum.
+3. **52-week-high breakouts** — closes within 2% of a fresh 52-week high on above-average volume (computed from the same download — no extra requests).
+4. **New-listing detector** — diffs today's NASDAQ symbol directory against the previous cached copy, surfacing brand-new IPOs/uplistings. (Needs one prior run as a baseline.)
+
+Candidates flagged by multiple sources rank up. Survivors of price/liquidity/market-cap filters get a quick two-lens rule-based score, and the best are appended to `watchlist.txt` with provenance comments:
+
+```bash
+# Full discovery scan (the volume scan takes a few minutes)
+python main.py --discover
+
+# Tune how many picks get added and the minimum market cap
+python main.py --discover --discover-top 10 --discover-min-cap 500000000
+
+# Promote discoveries into a full analysis (feeds the feedback loop)
+python main.py --file watchlist.txt --no-llm
+```
+
+`tickers.txt` is never modified automatically — you own it. The full ranked list with per-source notes is saved to `reports/discovery/discovery_{DATE}.csv`.
+
+### Step 6 — Train the pooled cross-ticker model (`--retrain-global`)
+
+Per-ticker models train on only ~1,250 rows each and overfit easily; brand-new tickers can't train at all. The global model stacks **every** ticker's feature history into one pooled dataset (all features are scale-independent ratios/z-scores, so rows are comparable across tickers):
+
+```bash
+python main.py --retrain-global
+```
+
+Once trained (saved under `models/_GLOBAL/`), the predictor automatically:
+- **blends** global and per-ticker probabilities, weighted by each model's validated walk-forward CV accuracy, and
+- serves **global-only** predictions for tickers with too little history for their own model — which is exactly what freshly discovered tickers need.
+
+Re-run it occasionally (e.g. after adding tickers or monthly) to refresh the pool.
 
 ### Output
 
@@ -814,15 +852,22 @@ Internally, it calls `run_rule_based_judge()`, which scores four deterministic l
 
 Up to 9 signals. Verdict: UNDERVALUED (≥66%) / FAIRLY VALUED (45–65%) / OVERVALUED (<45%).
 
+**Sector-relative grading:** trailing P/E, forward P/E and P/B are compared to the stock's
+**own sector-peer medians** (top ~100 US names in the sector by market cap, one key-free
+Yahoo screener request per sector, cached 7 days in `.cache/sector_medians.json`). A 30× P/E
+is cheap for semiconductors and expensive for banks — absolute bands punished growth sectors
+and flattered deep value. When sector data is unavailable (ETFs, network failure with no
+cache), the absolute thresholds below apply.
+
 | Signal | Threshold |
 |---|---|
-| Trailing P/E | <15×: 2pt · 15–25×: 1pt · >40×: 0pt |
-| Forward P/E | <15×: 2pt · 15–25×: 1pt · >25×: 0pt |
+| Trailing P/E | vs sector median — <0.8×: 2pt · 0.8–1.2×: 1pt · >1.2×: 0pt · (fallback: <15×: 2pt · 15–25×: 1pt · >40×: 0pt) |
+| Forward P/E | vs sector median — same bands (fallback: <15×: 2pt · 15–25×: 1pt · >25×: 0pt) |
 | PEG Ratio | <1.0: 2pt · 1.0–2.0: 1pt · >2.0: 0pt |
 | EV/EBITDA | <10×: 2pt · 10–20×: 1pt · >20×: 0pt |
 | DCF vs Price | Undervalued: 2pt · Within 20%: 1pt · Overvalued: 0pt |
 | Graham Number vs Price | Below: 2pt · Slightly above: 1pt · Well above: 0pt |
-| Price/Book | <1.5×: 2pt · 1.5–3.0×: 1pt · >3.0×: 0pt |
+| Price/Book | vs sector median — same bands (fallback: <1.5×: 2pt · 1.5–3.0×: 1pt · >3.0×: 0pt) |
 | Analyst Mean Target | >5% upside: 1pt · At/below target: 0pt |
 
 ### Lens 4 — Risk: "What is the downside exposure?"

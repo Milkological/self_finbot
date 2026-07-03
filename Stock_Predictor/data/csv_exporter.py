@@ -14,8 +14,8 @@ last row; all historical rows default to 0.0 / "NEUTRAL".
 import os
 import numpy as np
 import pandas as pd
-import yfinance as yf
 
+from data import market_data
 from data.stock_fetcher import fetch_vix_data
 
 
@@ -176,8 +176,7 @@ def _build_feature_df(
     # disruptor of technical patterns.
     feat["earnings_within_14d"] = 0.0
     try:
-        t = yf.Ticker(ticker)
-        earnings_df = t.get_earnings_dates(limit=20)
+        earnings_df = market_data.get_earnings_dates(ticker)
         if earnings_df is not None and not earnings_df.empty:
             earn_dates = pd.to_datetime(earnings_df.index).normalize()
             earn_dates_tz_naive = earn_dates.tz_localize(None) if earn_dates.tz is not None else earn_dates
@@ -190,6 +189,59 @@ def _build_feature_df(
                     feat.at[d, "earnings_within_14d"] = 1.0
     except Exception:
         pass  # Non-fatal — defaults to 0
+
+    # ── 6b. Additional leak-free engineered features ─────────────── #
+    # All derived from data already in hand (past-only windows).
+
+    # Relative strength vs the benchmark: stock return minus SPY return
+    # over the same window. Cross-sectional momentum — a stock rising 5%
+    # while the market rises 10% is lagging, not leading.
+    try:
+        from config import BENCHMARK_TICKER, HISTORY_PERIOD
+        spy_hist = market_data.get_history(BENCHMARK_TICKER, HISTORY_PERIOD)
+        spy_close = spy_hist["Close"].copy()
+        spy_close.index = pd.to_datetime(spy_close.index)
+        if spy_close.index.tz is not None:
+            spy_close.index = spy_close.index.tz_convert(None)
+        spy_close = spy_close.reindex(
+            pd.to_datetime(feat.index).normalize(), method="ffill"
+        )
+        spy_close.index = feat.index
+        for w in (21, 63):
+            feat[f"rel_strength_{w}d"] = (
+                feat["Close"].pct_change(w) - spy_close.pct_change(w)
+            )
+    except Exception:
+        feat["rel_strength_21d"] = np.nan
+        feat["rel_strength_63d"] = np.nan
+
+    # Overnight gap: open vs previous close, plus its 5-day mean.
+    # Persistent gapping signals institutional/news-driven repricing.
+    if "Open" in feat.columns:
+        feat["overnight_gap"] = feat["Open"] / feat["Close"].shift(1) - 1
+        feat["gap_5d_mean"]   = feat["overnight_gap"].rolling(5, min_periods=1).mean()
+
+    # ATR normalised by price (scale-independent daily-range regime).
+    prev_close = feat["Close"].shift(1)
+    tr = pd.concat([
+        feat["High"] - feat["Low"],
+        (feat["High"] - prev_close).abs(),
+        (feat["Low"]  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    feat["ATR_norm"] = (
+        tr.ewm(alpha=1.0 / 14, min_periods=14, adjust=False).mean() / feat["Close"]
+    )
+
+    # Drawdown from running peak (0 = at high; -0.3 = 30% below peak).
+    feat["drawdown_from_peak"] = feat["Close"] / feat["Close"].cummax() - 1
+
+    # Volume z-score: how unusual is today's volume vs the last 20 days.
+    if "Volume" in feat.columns:
+        vol_mean = feat["Volume"].rolling(20, min_periods=5).mean()
+        vol_std  = feat["Volume"].rolling(20, min_periods=5).std()
+        feat["volume_zscore_20d"] = (
+            (feat["Volume"] - vol_mean) / vol_std.replace(0, np.nan)
+        )
 
     # ── 7. Price z-score (mean-reversion signal) ─────────────────── #
     # Captures how stretched price is relative to its recent mean,

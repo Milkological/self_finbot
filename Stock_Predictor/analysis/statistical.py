@@ -17,33 +17,18 @@ All price predictions are computed at five horizons defined in config.py:
 import numpy as np
 import pandas as pd
 from scipy import stats as scipy_stats
-import yfinance as yf
 from config import (
     RISK_FREE_RATE,
     EQUITY_RISK_PREMIUM,
-    BENCHMARK_TICKER,
     MONTE_CARLO_PATHS,
     PREDICTION_HORIZONS,
 )
-
-# Module-level SPY cache — downloaded once per process to avoid a
-# redundant network round-trip on every compute_beta() call.
-_spy_cache: pd.DataFrame | None = None
+from data import market_data
 
 
 def _get_spy_data() -> pd.DataFrame:
-    """Return cached SPY price history, downloading it at most once."""
-    global _spy_cache
-    if _spy_cache is None:
-        spy = yf.download(BENCHMARK_TICKER, period="1y",
-                          auto_adjust=True, progress=False)
-        # Recent yfinance returns MultiIndex columns (field, ticker) even for a
-        # single symbol. Flatten to the field level so `spy["Close"]` is a
-        # Series, not a 1-column DataFrame (which breaks the Beta covariance).
-        if isinstance(spy.columns, pd.MultiIndex):
-            spy.columns = spy.columns.get_level_values(0)
-        _spy_cache = spy
-    return _spy_cache
+    """Return the process-wide cached SPY history (thread-safe)."""
+    return market_data.get_spy()
 
 
 # ------------------------------------------------------------------ #

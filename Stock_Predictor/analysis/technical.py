@@ -202,21 +202,16 @@ def compute_support_resistance(price_df: pd.DataFrame, window: int = 10) -> dict
       "resistance_levels" — list[float], up to 5 highest swing highs
       "support_levels"    — list[float], up to 5 lowest  swing lows
     """
-    highs = price_df["High"].values
-    lows  = price_df["Low"].values
-    n = len(highs)
+    highs = price_df["High"]
+    lows  = price_df["Low"]
 
-    swing_highs = []
-    swing_lows  = []
-
-    for i in range(window, n - window):
-        local_max = highs[i - window: i + window + 1].max()
-        local_min = lows[i  - window: i + window + 1].min()
-
-        if highs[i] == local_max:
-            swing_highs.append(highs[i])
-        if lows[i] == local_min:
-            swing_lows.append(lows[i])
+    # A bar is a swing high/low when it equals the max/min of the
+    # centered (2*window+1)-bar neighbourhood. rolling(center=True)
+    # yields NaN at the edges, which reproduces the loop bounds
+    # [window, n-window) of the previous implementation exactly.
+    span = 2 * window + 1
+    swing_highs = highs[highs == highs.rolling(span, center=True).max()].tolist()
+    swing_lows  = lows[lows  == lows.rolling(span,  center=True).min()].tolist()
 
     # De-duplicate levels that are within 0.5 % of each other
     def deduplicate(levels: list[float], tol: float = 0.005) -> list[float]:

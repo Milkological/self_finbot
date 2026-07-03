@@ -10,10 +10,15 @@ For each ticker four models are persisted under  models/{TICKER}/ :
 
 Alongside each model set we write:
   features.json  — ordered list of feature column names used at training time
-  metrics.json   — accuracy / MAE scores from the hold-out test split
+  metrics.json   — walk-forward CV accuracy / MAE scores
 
-Time-series split:  first 80 % of rows → train,  last 20 % → test.
-No shuffle is applied: leakage-free chronological validation.
+Validation: walk-forward (expanding-window) cross-validation via
+TimeSeriesSplit with a gap of ``h`` rows between train and test for each
+horizon — labels look ``h`` days ahead, so without the gap the last
+``h`` training rows would overlap the test window (leakage). Reported
+accuracy is the mean across folds; a LogisticRegression baseline is
+scored on the same folds so tree-ensemble overfitting is visible.
+The persisted models are then fitted on ALL labelled rows.
 
 Auto-retraining: if any model file is older than ML_RETRAIN_DAYS
 or missing, all four models are retrained from scratch.
@@ -29,7 +34,11 @@ import numpy as np
 import pandas as pd
 
 from sklearn.ensemble import GradientBoostingClassifier, GradientBoostingRegressor, RandomForestClassifier, RandomForestRegressor
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, mean_absolute_error
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from config import ML_MODELS_DIR, ML_MIN_TRAIN_ROWS, ML_RETRAIN_DAYS
 
@@ -60,8 +69,11 @@ FEATURE_COLS = [
     "Log_Return_lag1", "Log_Return_lag2", "Log_Return_lag3",
     # Volume context
     "Volume_ratio",
-    # Sentiment
-    "sentiment_score",
+    # NOTE: sentiment_score is intentionally NOT a feature — historical rows
+    # carry 0.0 (no headline archive), so training on it teaches the model a
+    # constant while inference feeds an out-of-distribution live value.
+    # Real per-day sentiment is being accumulated in
+    # feedback/sentiment_history_{TICKER}.csv for future reintroduction.
     # Regime features
     "ADX",
     "vol_regime_ratio",
@@ -72,6 +84,16 @@ FEATURE_COLS = [
     "earnings_within_14d",
     # Mean-reversion signal
     "price_zscore_20d",
+    # Cross-sectional momentum vs benchmark (SPY)
+    "rel_strength_21d", "rel_strength_63d",
+    # Overnight gap behaviour
+    "overnight_gap", "gap_5d_mean",
+    # Range / volatility regime (scale-independent)
+    "ATR_norm",
+    # Distance below running peak
+    "drawdown_from_peak",
+    # Volume anomaly
+    "volume_zscore_20d",
 ]
 
 # GradientBoosting hyper-parameters (conservative — limited data)
@@ -136,7 +158,9 @@ def load_or_train(ticker: str, csv_path: str, force_retrain: bool = False) -> di
             # the user never has to pass --retrain manually after an upgrade.
             stored_features = set(result.get("features", []))
             current_features = set(FEATURE_COLS)
-            if not current_features.issubset(stored_features):
+            # Strict inequality: a REMOVED feature must also trigger retrain
+            # (a subset check would keep loading models trained on it).
+            if current_features != stored_features:
                 logger.info(
                     "Ticker %s: feature set changed (%d stored vs %d current) — retraining.",
                     ticker,
@@ -203,46 +227,66 @@ def train_models(ticker: str, csv_path: str, models_dir: str | None = None) -> d
         y_clf = sub[target_clf].values
         y_reg = sub[target_reg].values
 
-        split = int(len(X) * 0.80)
-        X_tr, X_te = X.iloc[:split], X.iloc[split:]
-        y_clf_tr, y_clf_te = y_clf[:split], y_clf[split:]
-        y_reg_tr, y_reg_te = y_reg[:split], y_reg[split:]
+        # ── Walk-forward CV: honest out-of-sample estimates ──────── #
+        # gap=h keeps the last h training rows (whose forward-looking
+        # labels overlap the test window) out of every fold's train set.
+        fold_accs:     list[float] = []
+        baseline_accs: list[float] = []
+        fold_maes:     list[float] = []
+        n_splits = min(5, max(2, len(X) // 100))
+        try:
+            tscv = TimeSeriesSplit(n_splits=n_splits, gap=h)
+            for tr_idx, te_idx in tscv.split(X):
+                X_tr, X_te = X.iloc[tr_idx], X.iloc[te_idx]
+                if len(X_tr) < 50 or len(X_te) == 0:
+                    continue
 
-        # Classifier — GBM
-        clf_gb = GradientBoostingClassifier(**_GB_PARAMS)
-        clf_gb.fit(X_tr, y_clf_tr)
+                cv_gb = GradientBoostingClassifier(**_GB_PARAMS).fit(X_tr, y_clf[tr_idx])
+                cv_rf = RandomForestClassifier(**_RF_PARAMS).fit(X_tr, y_clf[tr_idx])
+                ens_probs = (cv_gb.predict_proba(X_te)[:, 1] +
+                             cv_rf.predict_proba(X_te)[:, 1]) / 2.0
+                fold_accs.append(accuracy_score(y_clf[te_idx], (ens_probs >= 0.5).astype(int)))
 
-        # Classifier — RandomForest (ensemble companion)
-        clf_rf = RandomForestClassifier(**_RF_PARAMS)
-        clf_rf.fit(X_tr, y_clf_tr)
+                # Linear baseline on the identical fold — if the tree
+                # ensemble can't beat this, its edge is likely noise.
+                try:
+                    base = make_pipeline(
+                        StandardScaler(),
+                        LogisticRegression(max_iter=1000, C=0.5),
+                    ).fit(X_tr, y_clf[tr_idx])
+                    baseline_accs.append(accuracy_score(y_clf[te_idx], base.predict(X_te)))
+                except Exception:
+                    pass
 
-        # Ensemble prediction: average probabilities from GBM and RF
-        if len(X_te) > 0:
-            gb_probs = clf_gb.predict_proba(X_te)[:, 1]
-            rf_probs = clf_rf.predict_proba(X_te)[:, 1]
-            ens_probs = (gb_probs + rf_probs) / 2.0
-            ens_preds = (ens_probs >= 0.5).astype(int)
-            clf_acc = accuracy_score(y_clf_te, ens_preds)
-        else:
-            clf_acc = float("nan")
+                cv_reg = GradientBoostingRegressor(**_GB_PARAMS).fit(X_tr, y_reg[tr_idx])
+                fold_maes.append(mean_absolute_error(y_reg[te_idx], cv_reg.predict(X_te)))
+        except Exception as cv_err:
+            logger.warning("Ticker %s: walk-forward CV failed (%s) — metrics will be NaN.", ticker, cv_err)
 
-        # Regressor — GBM
-        reg_gb = GradientBoostingRegressor(**_GB_PARAMS)
-        reg_gb.fit(X_tr, y_reg_tr)
+        clf_acc      = float(np.mean(fold_accs))     if fold_accs     else float("nan")
+        clf_acc_std  = float(np.std(fold_accs))      if fold_accs     else float("nan")
+        baseline_acc = float(np.mean(baseline_accs)) if baseline_accs else float("nan")
+        reg_mae      = float(np.mean(fold_maes))     if fold_maes     else float("nan")
 
-        # Regressor — RandomForest (ensemble companion)
-        reg_rf = RandomForestRegressor(**_RF_PARAMS)
-        reg_rf.fit(X_tr, y_reg_tr)
-
-        reg_mae = mean_absolute_error(y_reg_te, reg_gb.predict(X_te)) if len(X_te) > 0 else float("nan")
+        # ── Final models: fit on ALL labelled rows ───────────────── #
+        # Evaluation is CV-based above, so unlike the old 80/20 split we
+        # no longer waste the newest 20% of history at deployment time.
+        clf_gb = GradientBoostingClassifier(**_GB_PARAMS).fit(X, y_clf)
+        clf_rf = RandomForestClassifier(**_RF_PARAMS).fit(X, y_clf)
+        reg_gb = GradientBoostingRegressor(**_GB_PARAMS).fit(X, y_reg)
+        reg_rf = RandomForestRegressor(**_RF_PARAMS).fit(X, y_reg)
 
         models[f"clf_{h}d"]    = clf_gb   # GBM remains primary (for compatibility)
         models[f"clf_{h}d_rf"] = clf_rf
         models[f"reg_{h}d"]    = reg_gb
         models[f"reg_{h}d_rf"] = reg_rf
-        metrics[f"clf_{h}d_accuracy"] = round(clf_acc, 4)
-        metrics[f"reg_{h}d_mae"]      = round(reg_mae, 6)
-        metrics[f"used_cols_{h}d"]    = canonical_cols
+        metrics[f"clf_{h}d_accuracy"]        = round(clf_acc, 4)
+        metrics[f"clf_{h}d_accuracy_std"]    = round(clf_acc_std, 4)
+        metrics[f"clf_{h}d_fold_accuracies"] = [round(a, 4) for a in fold_accs]
+        metrics[f"baseline_{h}d_accuracy"]   = round(baseline_acc, 4)
+        metrics[f"reg_{h}d_mae"]             = round(reg_mae, 6)
+        metrics[f"used_cols_{h}d"]           = canonical_cols
+        metrics["validation"]                = f"walk_forward_cv_{n_splits}fold"
 
         # Feature importances — top 10 GBM features sorted by importance desc
         importances = clf_gb.feature_importances_

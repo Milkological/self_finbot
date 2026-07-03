@@ -5,6 +5,90 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) co
 
 ---
 
+## [1.4.0] — 2026-07-04
+
+This release **fixes real scoring bugs in the rule-based judge**, makes ML validation
+**honest (walk-forward CV)**, adds a **pooled cross-ticker model**, a **shared data cache**
+that removes every duplicate network fetch, and a new **`--discover` mode** that scans the
+whole market for fresh candidate tickers.
+
+### Fixed
+
+#### Rule-based judge crashed on strongly bearish stocks (`analysis/rule_based_judge.py`)
+- **What:** the STRONG BEARISH TREND label used an invalid f-string format spec
+  (`{pdi:.1f if pdi else '?'}`), raising `ValueError` whenever ADX > 25 with −DI dominant.
+  The exception was swallowed in `main.py`, so `--no-llm` silently returned the
+  "Rule-based analysis failed" stub for exactly the stocks that most needed a bearish verdict.
+- **Improvement:** values are pre-formatted; bearish names now score normally.
+
+#### Small ML adjustments were silently dropped (`analysis/rule_based_judge.py`)
+- **What:** when the Monte Carlo nudge recomputed the composite, the ML adjustment was only
+  re-applied when its note string was non-empty — i.e. adjustments under 1 pt vanished.
+- **Improvement:** the adjustment is computed once and always re-applied.
+
+#### Degenerate sentiment feature removed from ML (`ml/trainer.py`, `feedback/tracker.py`)
+- **What:** `sentiment_score` was 0.0 on every historical training row and only nonzero on the
+  inference row — the model learned a constant, then saw an out-of-distribution value live.
+- **Improvement:** dropped from `FEATURE_COLS`; the retrain-detection check was also tightened
+  from subset to equality so *removing* a feature now triggers retraining. Real per-day
+  sentiment is now archived to `feedback/sentiment_history_{TICKER}.csv` on every run so it can
+  return as a leak-free feature once enough history accumulates.
+
+#### Backfill stays out-of-sample under the new trainer (`feedback/backfiller.py`)
+- **What:** persisted models are now fitted on *all* rows (see below), so replaying them over
+  the last 20% would have been in-sample and inflated bootstrap accuracy.
+- **Improvement:** the backfiller fits its own temporary models on the first 80% only.
+
+### Changed
+
+#### Honest walk-forward validation (`ml/trainer.py`)
+- Single 80/20 split → **5-fold expanding-window CV** (`TimeSeriesSplit`) with a **gap equal to
+  the label horizon** (the old split leaked: forward-looking labels of the last train rows
+  overlapped the test window). Reported accuracy is the fold mean; std, per-fold values, and a
+  **LogisticRegression baseline** (overfit detector) are new additive metrics. Final persisted
+  models now train on **all** labelled rows instead of discarding the newest 20%.
+- **Expect reported accuracies to drop toward ~50–58%.** That is the honest number — the old
+  one was optimistic.
+
+#### Accuracy-gated ML modifier (`analysis/rule_based_judge.py`)
+- The ±10-pt ML composite adjustment is now scaled per horizon by validated CV skill:
+  ≤50% accuracy → zero influence; ≥65% → full weight. Calibrated probabilities are preferred.
+  A coin-flip model can no longer swing a recommendation.
+
+#### Shared market-data cache (`data/market_data.py`, new)
+- One `yf.Ticker`, one `.info`, one VIX series, one SPY history, one earnings calendar
+  **per process** (previously: `.info` ×3, VIX ×2, earnings ×2 per run). Batch mode prewarms
+  all tickers through a small thread pool before the sequential pipeline, and tests now mock a
+  single choke point.
+
+### Added
+
+- **New leak-free ML features** (`data/csv_exporter.py`): relative strength vs SPY (21/63d),
+  overnight gap + 5-day mean, normalised ATR, drawdown-from-peak, 20-day volume z-score.
+- **Pooled cross-ticker model** (`ml/global_trainer.py`, `--retrain-global`): one model trained
+  on every ticker's stacked history; the predictor blends it with per-ticker models weighted by
+  CV accuracy and uses it alone for tickers too young to train — the accuracy lever for
+  newly discovered names.
+- **Tuned decision thresholds** (`feedback/accuracy.py`): with ≥30 resolved outcomes, the
+  probability cutoff that maximises balanced accuracy is stored in `calibration.json` and used
+  by the predictor instead of a hard-coded 0.5.
+- **`--discover` mode** (`discovery/`): scans yfinance predefined screeners, a full-universe
+  volume-spike scan, 52-week-high breakouts, and a NASDAQ-directory new-listing diff; filters
+  for tradability; ranks candidates with a quick two-lens rule-based score; appends the best to
+  `watchlist.txt` with provenance (never touches `tickers.txt`). Ranked CSV under
+  `reports/discovery/`.
+- Watchlist/ticker files now support **inline `#` comments**.
+- Support/resistance pivot detection vectorised (was an O(n·window) Python loop).
+- **Sector-relative valuation** (`data/sector_data.py`): trailing P/E, forward P/E and P/B
+  are now graded against the stock's own sector-peer medians (top ~100 US names by market
+  cap, one key-free Yahoo screener request per sector, cached 7 days, with stale-cache and
+  static-table fallbacks). A 30× P/E is cheap for semis and expensive for banks — absolute
+  bands systematically punished growth sectors and flattered deep value. Signals now read
+  e.g. "DISCOUNT to sector (21.1× vs peer median 26.5×)". PEG/EV-EBITDA/P-S/DCF/Graham keep
+  their absolute thresholds (peer medians for those aren't available from screener quotes).
+
+---
+
 ## [1.3.0] — 2026-06-24
 
 This release **repairs and grounds the feedback loop**, **speeds up the LLM pipeline**, and

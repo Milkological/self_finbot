@@ -14,7 +14,8 @@ WHY these tests exist:
       safe default dict rather than propagating the exception.
 
 HOW mocking works here:
-  We patch 'data.analyst_fetcher.yf.Ticker' to control what yfinance returns.
+  We patch 'data.market_data.yf' (the process-wide cache layer every
+  fetcher routes through) to control what yfinance returns.
 """
 
 import unittest
@@ -31,6 +32,12 @@ from data.analyst_fetcher import fetch_analyst_data
 
 class TestFetchAnalystData(unittest.TestCase):
     """Tests for fetch_analyst_data() with yfinance network calls mocked."""
+
+    def setUp(self):
+        # market_data memoises per-symbol results for the whole process;
+        # clear it so each test's mock configuration takes effect.
+        from data import market_data
+        market_data.clear_cache()
 
     # Required keys that every caller (display, report, PDF) reads from the dict.
     REQUIRED_KEYS = (
@@ -67,16 +74,18 @@ class TestFetchAnalystData(unittest.TestCase):
         mock.earnings_dates = None
         return mock
 
-    @patch("data.analyst_fetcher.yf.Ticker")
-    def test_all_required_keys_present(self, mock_ticker_cls):
+    @patch("data.market_data.yf.download")
+    @patch("data.market_data.yf.Ticker")
+    def test_all_required_keys_present(self, mock_ticker_cls, _mock_download):
         # Normal happy-path: all fields returned by yfinance.
         mock_ticker_cls.return_value = self._make_mock_ticker()
         result = fetch_analyst_data("FAKE")
         for key in self.REQUIRED_KEYS:
             self.assertIn(key, result, msg=f"Key '{key}' missing from analyst_data")
 
-    @patch("data.analyst_fetcher.yf.Ticker")
-    def test_graceful_failure_still_returns_dict(self, mock_ticker_cls):
+    @patch("data.market_data.yf.download")
+    @patch("data.market_data.yf.Ticker")
+    def test_graceful_failure_still_returns_dict(self, mock_ticker_cls, _mock_download):
         # Even when the .info property raises (simulating ETF / no coverage),
         # the function must return a dict — never propagate the exception.
         mock_ticker_cls.return_value = self._make_mock_ticker(raise_on_info=True)
@@ -88,16 +97,18 @@ class TestFetchAnalystData(unittest.TestCase):
                 f"fetch_analyst_data raised an unexpected exception: {exc!r}"
             )
 
-    @patch("data.analyst_fetcher.yf.Ticker")
-    def test_news_is_list(self, mock_ticker_cls):
+    @patch("data.market_data.yf.download")
+    @patch("data.market_data.yf.Ticker")
+    def test_news_is_list(self, mock_ticker_cls, _mock_download):
         # Downstream code iterates over news with a for-loop;
         # it must always be a list (never None).
         mock_ticker_cls.return_value = self._make_mock_ticker()
         result = fetch_analyst_data("FAKE")
         self.assertIsInstance(result.get("news"), list)
 
-    @patch("data.analyst_fetcher.yf.Ticker")
-    def test_recommendation_key_is_string(self, mock_ticker_cls):
+    @patch("data.market_data.yf.download")
+    @patch("data.market_data.yf.Ticker")
+    def test_recommendation_key_is_string(self, mock_ticker_cls, _mock_download):
         # The recommendation_key is used as a display string and for mapping
         # to colour codes — it must always be a str.
         mock_ticker_cls.return_value = self._make_mock_ticker()

@@ -8,10 +8,10 @@ Returns two artefacts:
   • info_dict — flat dict of fundamental / company metadata fields
 """
 
-import yfinance as yf
 import pandas as pd
 import numpy as np
 from config import HISTORY_PERIOD
+from data import market_data
 
 
 def fetch_stock_data(ticker: str) -> tuple[pd.DataFrame, dict]:
@@ -44,21 +44,24 @@ def fetch_stock_data(ticker: str) -> tuple[pd.DataFrame, dict]:
         If the ticker is not found or history is empty (invalid symbol).
     """
 
-    stock = yf.Ticker(ticker)
-
     # ------------------------------------------------------------------ #
     # 1. Price history
     # ------------------------------------------------------------------ #
     # HISTORY_PERIOD is set in config.py (default "2y").
-    # We use 'auto_adjust=True' so dividends / splits are baked in,
-    # which is the standard in quantitative work to avoid spurious drops.
-    price_df: pd.DataFrame = stock.history(period=HISTORY_PERIOD, auto_adjust=True)
+    # auto_adjust=True bakes in dividends / splits, the standard in
+    # quantitative work. Served from the process-wide cache so batch
+    # prewarm and repeat callers don't re-download.
+    price_df: pd.DataFrame = market_data.get_history(ticker, HISTORY_PERIOD)
 
     if price_df.empty:
         raise ValueError(
             f"No price data returned for '{ticker}'. "
             "Check that the ticker symbol is valid on Yahoo Finance."
         )
+
+    # Work on a copy — the cached DataFrame must stay pristine for
+    # other consumers of market_data.get_history().
+    price_df = price_df.copy()
 
     # Normalise column names to title-case so every downstream module
     # can safely reference price_df['Close'], price_df['Volume'], etc.
@@ -78,12 +81,9 @@ def fetch_stock_data(ticker: str) -> tuple[pd.DataFrame, dict]:
     # 2. Fundamental / company info
     # ------------------------------------------------------------------ #
     # ETFs (e.g. VT, SPY, QQQ) don't have a quoteSummary on Yahoo Finance,
-    # so stock.info raises an HTTP 404. Fall back to an empty dict so the
-    # rest of the pipeline degrades gracefully with N/A fundamental metrics.
-    try:
-        info: dict = stock.info  # dict with 100+ fields; missing fields → None
-    except Exception:
-        info = {}
+    # so .info raises an HTTP 404. market_data.get_info() returns {} in
+    # that case so the pipeline degrades gracefully with N/A fundamentals.
+    info: dict = market_data.get_info(ticker)
 
     # Provide safe fallbacks for critical fields so downstream code can
     # always access them without KeyError / None-check boilerplate.
@@ -137,23 +137,7 @@ def fetch_vix_data(start: str, end: str) -> "pd.Series":
     pd.Series indexed by date (DatetimeIndex, tz-naive), values = VIX close.
     Returns an empty Series on any failure so callers degrade gracefully.
     """
-    try:
-        # NOTE: `show_errors` was removed in recent yfinance versions and now
-        # raises TypeError if passed, which previously zeroed the VIX feature
-        # silently. Omit it and rely on the empty-DataFrame check + try/except.
-        df = yf.download("^VIX", start=start, end=end, auto_adjust=True,
-                         progress=False)
-        if df.empty:
-            return pd.Series(dtype=float)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        series = df["Close"].copy()
-        series.index = pd.to_datetime(series.index)
-        if series.index.tz is not None:
-            series.index = series.index.tz_convert(None)
-        return series
-    except Exception:
-        return pd.Series(dtype=float)
+    return market_data.get_vix(start, end)
 
 
 def fetch_options_data(ticker: str) -> dict:
@@ -171,7 +155,7 @@ def fetch_options_data(ticker: str) -> dict:
     """
     result = {"put_call_ratio": None, "options_iv_avg": None}
     try:
-        stock = yf.Ticker(ticker)
+        stock = market_data.get_ticker(ticker)
         expirations = stock.options
         if not expirations:
             return result

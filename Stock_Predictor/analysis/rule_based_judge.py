@@ -36,6 +36,8 @@ over available points only, so ETFs and REITs without EPS are not unfairly
 penalised. N/A → possible and earned both stay at 0 for that criterion.
 """
 
+import math
+
 
 # ------------------------------------------------------------------ #
 # Helpers
@@ -283,7 +285,9 @@ def _score_technical(technical: dict, statistical: dict, info: dict) -> dict:
         if trend_strong and bullish_dir:
             pts = 2; label = f"STRONG BULLISH TREND (ADX={adx:.1f}, PDI={pdi:.1f}>NDI={ndi:.1f})"
         elif trend_strong and not bullish_dir:
-            pts = 0; label = f"STRONG BEARISH TREND (ADX={adx:.1f}, PDI={pdi:.1f if pdi else '?'}<NDI={ndi:.1f if ndi else '?'})"
+            pdi_s = f"{pdi:.1f}" if pdi is not None else "?"
+            ndi_s = f"{ndi:.1f}" if ndi is not None else "?"
+            pts = 0; label = f"STRONG BEARISH TREND (ADX={adx:.1f}, PDI={pdi_s}<NDI={ndi_s})"
         elif adx > 20:
             pts = 1; label = f"TRANSITIONING (ADX={adx:.1f})"
         else:
@@ -399,7 +403,26 @@ def _score_technical(technical: dict, statistical: dict, info: dict) -> dict:
 # Lens 3 — Valuation: "Am I overpaying?"
 # ------------------------------------------------------------------ #
 
-def _score_valuation(fundamental: dict, analyst_data: dict, info: dict) -> dict:
+def _relative_multiple_pts(value: float, median: float) -> tuple:
+    """
+    Grade a valuation multiple against its sector-peer median.
+
+      < 0.80× median → 2 pts (discount to peers)
+      0.80–1.20×     → 1 pt  (in line)
+      > 1.20×        → 0 pts (premium to peers)
+
+    Returns (points, label).
+    """
+    ratio = value / median
+    if ratio < 0.80:
+        return 2, f"DISCOUNT to sector ({value:.1f}× vs peer median {median:.1f}×)"
+    if ratio <= 1.20:
+        return 1, f"IN LINE with sector ({value:.1f}× vs peer median {median:.1f}×)"
+    return 0, f"PREMIUM to sector ({value:.1f}× vs peer median {median:.1f}×)"
+
+
+def _score_valuation(fundamental: dict, analyst_data: dict, info: dict,
+                     sector_multiples: dict = None) -> dict:
     earned   = 0
     possible = 0
     signals  = []
@@ -411,14 +434,20 @@ def _score_valuation(fundamental: dict, analyst_data: dict, info: dict) -> dict:
     graham = fundamental.get("graham", {})
     pb_div = fundamental.get("pb_div", {})
     pt     = analyst_data.get("price_target") or {}
+    sm     = sector_multiples or {}
 
     # ── Trailing P/E ──────────────────────────────────────────── #
+    # Sector-relative when peer medians are available (a 30× P/E is
+    # cheap for semis, expensive for banks); absolute bands otherwise.
     t_pe     = pe.get("trailing_pe")
     has_t_pe = t_pe is not None and t_pe > 0
+    sec_t_pe = sm.get("trailing_pe")
     if t_pe is not None:
         possible += 2
         if t_pe < 0:
             pts = 0; label = "NEGATIVE EPS (loss-making)"
+        elif sec_t_pe:
+            pts, label = _relative_multiple_pts(t_pe, sec_t_pe)
         elif t_pe < 15:
             pts = 2; label = "CHEAP (<15×)"
         elif t_pe < 25:
@@ -433,9 +462,13 @@ def _score_valuation(fundamental: dict, analyst_data: dict, info: dict) -> dict:
     # ── Forward P/E ───────────────────────────────────────────── #
     # More relevant than trailing for growth stocks.
     f_pe = pe.get("forward_pe")
+    sec_f_pe = sm.get("forward_pe")
     if f_pe is not None and f_pe > 0:
         possible += 2
-        if f_pe < 15:
+        if sec_f_pe:
+            pts, label = _relative_multiple_pts(f_pe, sec_f_pe)
+            label = label.replace("sector (", "sector fwd (")
+        elif f_pe < 15:
             pts = 2; label = "CHEAP FORWARD (<15×)"
         elif f_pe < 25:
             pts = 1; label = "FAIR FORWARD (15–25×)"
@@ -518,9 +551,12 @@ def _score_valuation(fundamental: dict, analyst_data: dict, info: dict) -> dict:
 
     # ── Price-to-Book ─────────────────────────────────────────── #
     pb = pb_div.get("price_to_book")
+    sec_pb = sm.get("price_to_book")
     if pb is not None:
         possible += 2
-        if pb < 1.5:
+        if pb > 0 and sec_pb:
+            pts, label = _relative_multiple_pts(pb, sec_pb)
+        elif pb < 1.5:
             pts = 2; label = "LOW P/B (<1.5×)"
         elif pb < 3.0:
             pts = 1; label = "MODERATE P/B (1.5–3.0×)"
@@ -557,6 +593,11 @@ def _score_valuation(fundamental: dict, analyst_data: dict, info: dict) -> dict:
         f"Valuation score {score:.0f}/100 (Grade {grade}). "
         f"Stock appears {verdict.replace('_', ' ')} on balance."
     )
+    if sm:
+        sector = info.get("sector") or "sector"
+        n_peers = sm.get("n") or 0
+        peers_str = f"{n_peers} largest {sector} peers" if n_peers else f"{sector} sector medians"
+        summary += f" P/E, forward P/E and P/B graded relative to {peers_str}."
 
     return {
         "score":    score,
@@ -566,6 +607,7 @@ def _score_valuation(fundamental: dict, analyst_data: dict, info: dict) -> dict:
         "summary":  summary,
         "earned":   earned,
         "possible": possible,
+        "sector_multiples": sm or None,
     }
 
 
@@ -704,9 +746,20 @@ def run_rule_based_judge(
     The dict mirrors the shape expected by terminal_display and report_generator
     so they can render it without special-casing.
     """
+    # Sector-peer medians for relative multiple grading (one cached
+    # screener request per sector per week; None for ETFs/unknown
+    # sectors, in which case absolute thresholds apply). Lazy import
+    # keeps this module dependency-free for pure-dict callers/tests.
+    sector_multiples = None
+    try:
+        from data.sector_data import get_sector_multiples
+        sector_multiples = get_sector_multiples(info.get("sector"))
+    except Exception:
+        pass
+
     fund = _score_fundamental(info, statistical)
     tech = _score_technical(technical, statistical, info)
-    val  = _score_valuation(fundamental, analyst_data, info)
+    val  = _score_valuation(fundamental, analyst_data, info, sector_multiples)
     risk = _score_risk(statistical, analyst_data, info)
 
     # ── Base composite (weighted) ────────────────────────────── #
@@ -734,21 +787,43 @@ def run_rule_based_judge(
         w_risk * risk["score"]
     )
 
-    # ── ML score modifier (bounded ±10 pts) ──────────────────── #
-    ml_note = ""
+    # ── ML score modifier (bounded ±10 pts, accuracy-gated) ────── #
+    # Each horizon's contribution is scaled by that model's walk-forward
+    # CV skill: a coin-flip model (≤50% accuracy) moves the composite by
+    # nothing; a ≥65%-accuracy model gets full weight. This stops noisy
+    # per-ticker models from swinging recommendations.
+    ml_note   = ""
+    ml_adjust = 0.0
     if ml_result and isinstance(ml_result, dict):
-        p5  = ml_result.get("clf_5d_prob_up")
-        p21 = ml_result.get("clf_21d_prob_up")
-        if isinstance(p5, float) and isinstance(p21, float):
-            avg_prob   = (p5 + p21) / 2
-            ml_adjust  = max(-10.0, min(10.0, (avg_prob - 0.5) * 20))
+        ml_metrics = ml_result.get("metrics") or {}
+        horizon_adjusts = []
+        probs_shown = []
+        for h in (5, 21):
+            # Prefer the feedback-calibrated probability when present.
+            p = ml_result.get(f"clf_{h}d_prob_up_cal")
+            if not isinstance(p, float):
+                p = ml_result.get(f"clf_{h}d_prob_up")
+            if not isinstance(p, float):
+                continue
+            acc = ml_metrics.get(f"clf_{h}d_accuracy")
+            if isinstance(acc, (int, float)) and not math.isnan(acc):
+                skill = max(0.0, min(1.0, (acc - 0.5) / 0.15))
+            else:
+                skill = 0.0     # no validated skill → no influence
+            horizon_adjusts.append(skill * max(-10.0, min(10.0, (p - 0.5) * 20)))
+            probs_shown.append(f"{p:.0%}")
+        if horizon_adjusts:
+            ml_adjust = sum(horizon_adjusts) / len(horizon_adjusts)
             composite += ml_adjust
-            direction  = "bullish" if ml_adjust > 0 else "bearish"
+            direction = "bullish" if ml_adjust > 0 else "bearish"
             if abs(ml_adjust) >= 1.0:
                 ml_note = (
-                    f" ML signals lean {direction} ({p5:.0%}/{p21:.0%} prob-up); "
+                    f" ML signals lean {direction} ({'/'.join(probs_shown)} prob-up, "
+                    f"weighted by validated accuracy); "
                     f"composite adjusted by {ml_adjust:+.1f}pts."
                 )
+            elif probs_shown:
+                ml_note = " ML influence muted (models show no validated edge over coin-flip)."
 
     # ── Monte Carlo cross-validation (small valuation nudge) ─── #
     mc_preds = statistical.get("monte_carlo", {}).get("predictions", {})
@@ -769,11 +844,7 @@ def run_rule_based_judge(
                 w_val  * val["score"]  +
                 w_risk * risk["score"]
             )
-            if ml_result and ml_note:
-                # Re-apply ML adjust
-                avg_prob  = (ml_result.get("clf_5d_prob_up", 0.5) + ml_result.get("clf_21d_prob_up", 0.5)) / 2
-                ml_adjust = max(-10.0, min(10.0, (avg_prob - 0.5) * 20))
-                composite += ml_adjust
+            composite += ml_adjust
 
     effective_weights = {"fundamental": w_fund, "technical": w_tech, "valuation": w_val, "risk": w_risk}
 
@@ -1247,3 +1318,25 @@ def run_rule_based_analysis(
         "rule_based_judge":   rbj,
         "_ml_accuracy":       (ml_result or {}).get("metrics", {}),
     }
+
+
+# ------------------------------------------------------------------ #
+# Quick judge — lightweight two-lens score for the discovery screener
+# ------------------------------------------------------------------ #
+
+def run_quick_judge(info: dict, technical: dict) -> dict:
+    """
+    Score a discovery candidate using only the fundamental and technical
+    lenses (no statistical models, analyst data, or ML — those need the
+    full pipeline and would make a broad market scan far too slow).
+
+    Missing data is skipped, not penalised, exactly as in the full
+    judge, so thin/young tickers degrade toward a neutral 50.
+
+    Returns {"fundamental": {...}, "technical": {...}} — each the same
+    dict shape the full lens scorers produce (score / grade / verdict /
+    signals).
+    """
+    fund = _score_fundamental(info, {})
+    tech = _score_technical(technical, {}, info)
+    return {"fundamental": fund, "technical": tech}

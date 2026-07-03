@@ -77,6 +77,15 @@ reports/
 models/**/*.pkl
 models/**/features.json
 models/**/metrics.json
+models/**/calibration.json
+
+
+# ---------------------------------------------------------------------------
+# Runtime fetch cache
+# ---------------------------------------------------------------------------
+# .cache/ holds short-TTL cached market data (symbol directories, screener
+# snapshots) so repeated runs don't hammer the data providers.
+.cache/
 
 
 # ---------------------------------------------------------------------------
@@ -120,3 +129,5 @@ coverage.xml
 *.pyc
 
 
+
+feedback/*.csv

@@ -56,7 +56,7 @@ from ml.trainer    import load_or_train
 from ml.predictor  import predict as ml_predict
 from feedback.resolver import resolve_pending
 from feedback.accuracy import get_context as get_accuracy_context, build_calibration_table
-from feedback.tracker  import save_prediction as save_feedback
+from feedback.tracker  import save_prediction as save_feedback, save_sentiment_history
 from feedback.backfiller import backfill_historical_predictions, needs_backfill
 
 console = Console()
@@ -74,11 +74,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     # ------------------------------------------------------------------
-    # Input source — exactly one of --ticker or --file must be supplied.
-    # We use a mutually exclusive group so argparse enforces this at the
-    # CLI level and prints a clear error message when violated.
+    # Input source — at most one of --ticker or --file may be supplied.
+    # Standalone modes (--resolve, --backfill, --retrain-global,
+    # --discover) may run without either, so the group itself is not
+    # required; the check after parsing enforces that an analysis run
+    # names its input.
     # ------------------------------------------------------------------
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group(required=False)
     source.add_argument(
         "--ticker", "-t",
         type = str,
@@ -108,6 +110,17 @@ def parse_args() -> argparse.Namespace:
         help    = "Force retraining of ML models even if cached models are fresh",
     )
     parser.add_argument(
+        "--retrain-global",
+        action  = "store_true",
+        default = False,
+        help    = (
+            "(Re)train the pooled cross-ticker model (models/_GLOBAL/) from every\n"
+            "ticker's most recent features.csv, then exit. Once trained, the\n"
+            "predictor automatically blends it with per-ticker models and uses it\n"
+            "alone for tickers with too little history to train on."
+        ),
+    )
+    parser.add_argument(
         "--resolve",
         action  = "store_true",
         default = False,
@@ -125,7 +138,41 @@ def parse_args() -> argparse.Namespace:
             "into the feedback CSV to bootstrap accuracy statistics, then exit."
         ),
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--discover",
+        action  = "store_true",
+        default = False,
+        help    = (
+            "Scan the market for new candidate tickers (yfinance screeners,\n"
+            "volume spikes, 52-week-high breakouts, new listings), rank them\n"
+            "with a quick rule-based score, and append the best to watchlist.txt."
+        ),
+    )
+    parser.add_argument(
+        "--discover-top",
+        type    = int,
+        default = 5,
+        metavar = "N",
+        help    = "How many top-ranked discoveries to append to watchlist.txt (default 5)",
+    )
+    parser.add_argument(
+        "--discover-min-cap",
+        type    = float,
+        default = 100e6,
+        metavar = "USD",
+        help    = "Minimum market cap filter for discovered tickers (default 100000000)",
+    )
+
+    args = parser.parse_args()
+
+    # Analysis runs need an input source; standalone maintenance modes
+    # (--resolve/--backfill default to tickers.txt, --retrain-global and
+    # --discover need none) do not.
+    if not any((args.ticker, args.file, args.resolve, args.backfill,
+                args.retrain_global, args.discover)):
+        parser.error("one of --ticker/--file (or a standalone mode: "
+                     "--resolve, --backfill, --retrain-global, --discover) is required")
+    return args
 
 
 # ------------------------------------------------------------------ #
@@ -251,6 +298,12 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
         try:
             headlines = analyst_data.get("news", [])
             sentiment = score_headlines(headlines)
+            try:
+                # Archive today's sentiment so a real per-day history
+                # accumulates for future leak-free use as an ML feature.
+                save_sentiment_history(ticker, sentiment)
+            except Exception:
+                pass
             csv_path  = export_features_csv(
                 ticker, price_df, technical, info, sentiment, report_dir
             )
@@ -462,9 +515,11 @@ def _read_tickers_file(path: str) -> list[str]:
 
     tickers: list[str] = []
     for line in lines:
-        # Strip whitespace and ignore comment / blank lines.
-        token = line.strip()
-        if not token or token.startswith("#"):
+        # Drop inline comments (watchlist.txt entries carry provenance
+        # like "QUBT  # discovered 2026-07-04 via day_gainers"), then
+        # strip whitespace and ignore comment / blank lines.
+        token = line.split("#", 1)[0].strip()
+        if not token:
             continue
         tickers.append(token.upper())
 
@@ -480,6 +535,40 @@ def _read_tickers_file(path: str) -> list[str]:
 
 if __name__ == "__main__":
     args = parse_args()
+
+    # ── --retrain-global mode: train pooled model and exit ─────── #
+    if args.retrain_global:
+        from ml.global_trainer import train_global_models
+        console.print("\n[bold cyan]FinBot — Training pooled cross-ticker model[/bold cyan]\n")
+        with console.status("[dim]Stacking features and running walk-forward CV…[/dim]"):
+            gres = train_global_models()
+        if gres["status"] == "trained":
+            m = gres["metrics"]
+            console.print(
+                f"[bold green]Global model trained[/bold green] on "
+                f"{gres['rows']} pooled rows from {len(gres['tickers'])} ticker(s): "
+                f"{', '.join(gres['tickers'])}"
+            )
+            for h in (5, 21):
+                acc = m.get(f"clf_{h}d_accuracy")
+                std = m.get(f"clf_{h}d_accuracy_std")
+                console.print(f"  {h:>2}d direction CV accuracy: {acc} (±{std})")
+        else:
+            console.print(
+                "[yellow]Not enough pooled data to train — run a few normal "
+                "analyses first so reports/*/features.csv exist.[/yellow]"
+            )
+        sys.exit(0)
+
+    # ── --discover mode: scan market for new candidates and exit ─ #
+    if args.discover:
+        from discovery.screener import run_discovery
+        run_discovery(
+            console  = console,
+            top_n    = args.discover_top,
+            min_cap  = args.discover_min_cap,
+        )
+        sys.exit(0)
 
     # ── --resolve mode: settle pending predictions and exit ────── #
     if args.resolve:
@@ -584,6 +673,25 @@ if __name__ == "__main__":
             f"[bold cyan]FinBot batch run[/bold cyan] — "
             f"{len(tickers)} ticker(s) from [yellow]{args.file}[/yellow]\n"
         )
+
+        # ── Prewarm the shared data cache in parallel ───────────────── #
+        # Fetch each ticker's history/info/news/earnings (plus VIX and
+        # SPY once for the whole batch) into data/market_data.py's cache
+        # so the sequential pipeline below runs from memory. Worker count
+        # is deliberately low to stay clear of Yahoo rate limits.
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            from data import market_data
+            from config import HISTORY_PERIOD
+
+            with console.status("[dim]Prewarming market data cache…[/dim]"):
+                market_data.get_spy()
+                market_data.get_vix_latest()
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    for t in tickers:
+                        pool.submit(market_data.prewarm_symbol, t, HISTORY_PERIOD)
+        except Exception as warm_err:
+            console.log(f"[dim yellow]Cache prewarm error (non-fatal): {warm_err}[/dim yellow]")
 
         results: dict[str, str] = {}  # ticker → "ok" | error message
 

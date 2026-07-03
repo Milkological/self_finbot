@@ -13,7 +13,7 @@ WHY these tests exist:
     - The returned DataFrame has a 'Log_Return' column added by the function.
 
 HOW mocking works here:
-  We use unittest.mock.patch to replace 'data.stock_fetcher.yf.Ticker' with
+  We use unittest.mock.patch to replace 'data.market_data.yf.Ticker' with
   a MagicMock whose .history() method returns a pre-built synthetic DataFrame.
   The real yfinance library is never contacted.
 """
@@ -73,7 +73,13 @@ def _make_fake_info() -> dict:
 class TestFetchStockData(unittest.TestCase):
     """Tests for fetch_stock_data() with yfinance mocked out."""
 
-    @patch("data.stock_fetcher.yf.Ticker")
+    def setUp(self):
+        # market_data memoises per-symbol results for the whole process;
+        # clear it so each test's mock configuration takes effect.
+        from data import market_data
+        market_data.clear_cache()
+
+    @patch("data.market_data.yf.Ticker")
     def test_returns_dataframe_and_dict(self, mock_ticker_cls):
         # Configure the mock: .history() returns a valid synthetic DataFrame,
         # .info returns a minimal metadata dict.
@@ -87,7 +93,7 @@ class TestFetchStockData(unittest.TestCase):
         self.assertIsInstance(price_df, pd.DataFrame, "price_df should be a DataFrame")
         self.assertIsInstance(info, dict, "info should be a dict")
 
-    @patch("data.stock_fetcher.yf.Ticker")
+    @patch("data.market_data.yf.Ticker")
     def test_log_return_column_added(self, mock_ticker_cls):
         # fetch_stock_data() must append a 'Log_Return' column before returning.
         # This column is consumed by every statistical model.
@@ -99,7 +105,7 @@ class TestFetchStockData(unittest.TestCase):
         price_df, _ = fetch_stock_data("FAKE")
         self.assertIn("Log_Return", price_df.columns)
 
-    @patch("data.stock_fetcher.yf.Ticker")
+    @patch("data.market_data.yf.Ticker")
     def test_invalid_ticker_raises_value_error(self, mock_ticker_cls):
         # yfinance signals an invalid ticker by returning an empty DataFrame.
         # fetch_stock_data() must translate this into a ValueError with a
@@ -112,7 +118,7 @@ class TestFetchStockData(unittest.TestCase):
         with self.assertRaises(ValueError):
             fetch_stock_data("INVALID_XYZ_TICKER")
 
-    @patch("data.stock_fetcher.yf.Ticker")
+    @patch("data.market_data.yf.Ticker")
     def test_required_ohlcv_columns_present(self, mock_ticker_cls):
         # The returned DataFrame must have the standard OHLCV columns that
         # the entire downstream pipeline depends on.
@@ -125,7 +131,7 @@ class TestFetchStockData(unittest.TestCase):
         for col in ("Open", "High", "Low", "Close", "Volume"):
             self.assertIn(col, price_df.columns, msg=f"Column '{col}' missing from price_df")
 
-    @patch("data.stock_fetcher.yf.Ticker")
+    @patch("data.market_data.yf.Ticker")
     def test_ticker_normalised_to_uppercase(self, mock_ticker_cls):
         # Tickers should be normalised so 'aapl' and 'AAPL' both work.
         mock_instance = MagicMock()

@@ -56,6 +56,38 @@ def _csv_path(ticker: str) -> str:
     return os.path.join(FEEDBACK_DIR, f"{ticker.upper()}_feedback.csv")
 
 
+def save_sentiment_history(ticker: str, sentiment: dict) -> str:
+    """
+    Append today's headline-sentiment score to
+    feedback/sentiment_history_{TICKER}.csv (one row per calendar day).
+
+    This builds a genuine per-day sentiment archive over time so that
+    sentiment can eventually be reintroduced as an ML feature without
+    look-ahead bias (historical CSV rows currently have no real
+    sentiment — see ml/trainer.py FEATURE_COLS note).
+
+    Returns the path to the CSV file. Same-day reruns overwrite the
+    existing row for today rather than duplicating it.
+    """
+    os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    path  = os.path.join(FEEDBACK_DIR, f"sentiment_history_{ticker.upper()}.csv")
+    today = datetime.date.today().isoformat()
+    row   = {
+        "date":            today,
+        "sentiment_score": float(sentiment.get("overall_score", 0.0)),
+        "sentiment_label": str(sentiment.get("label", "NEUTRAL")),
+    }
+
+    if os.path.isfile(path):
+        df = pd.read_csv(path, dtype={"date": str})
+        df = df[df["date"] != today]                    # upsert today's row
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    else:
+        df = pd.DataFrame([row])
+    df.to_csv(path, index=False)
+    return path
+
+
 def save_prediction(
     ticker:       str,
     mode:         str,          # "llm" or "no_llm"

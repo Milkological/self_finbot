@@ -155,9 +155,33 @@ class TestPredict(unittest.TestCase):
                                   msg=f"{key} has unexpected value '{val}'")
 
     def test_predict_insufficient_data_returns_stub(self):
-        # When the trainer_result has no models (status=insufficient_data),
-        # predict() must return the stub immediately rather than raising
-        # an AttributeError trying to call .predict_proba() on a None model.
+        # When the trainer_result has no models (status=insufficient_data)
+        # AND no pooled global model exists, predict() must return the stub
+        # immediately rather than raising an AttributeError trying to call
+        # .predict_proba() on a None model. The global fallback is patched
+        # out so this test does not depend on models/_GLOBAL/ artifacts on
+        # the developer's machine.
+        from unittest.mock import patch
+        stub_result = {
+            "status":  "insufficient_data",
+            "models":  {},
+            "metrics": {},
+            "trained_on_rows": 0,
+            "features": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp,                 patch("ml.predictor.global_trainer.load_global_models", return_value=None):
+            csv_path = _make_training_csv(n=10, tmp_dir=tmp)
+            result   = predict(csv_path, stub_result)
+            self.assertEqual(result["status"], "insufficient_data")
+            # Probability fields must be None (not a float) in the stub.
+            self.assertIsNone(result.get("clf_5d_prob_up"))
+            self.assertIsNone(result.get("clf_21d_prob_up"))
+
+    def test_predict_insufficient_data_uses_global_when_available(self):
+        # With a pooled global model present, a short-history ticker gets
+        # real (global-only) predictions with status "ok_global" instead of
+        # the empty stub — this is the discovery-ticker code path.
+        from unittest.mock import patch
         stub_result = {
             "status":  "insufficient_data",
             "models":  {},
@@ -166,12 +190,17 @@ class TestPredict(unittest.TestCase):
             "features": [],
         }
         with tempfile.TemporaryDirectory() as tmp:
-            csv_path = _make_training_csv(n=10, tmp_dir=tmp)
-            result   = predict(csv_path, stub_result)
-            self.assertEqual(result["status"], "insufficient_data")
-            # Probability fields must be None (not a float) in the stub.
-            self.assertIsNone(result.get("clf_5d_prob_up"))
-            self.assertIsNone(result.get("clf_21d_prob_up"))
+            csv_path, trainer_result = _train_and_get_result(tmp)
+            fake_global = {
+                "models":   trainer_result["models"],
+                "features": trainer_result["features"],
+                "metrics":  trainer_result["metrics"],
+            }
+            with patch("ml.predictor.global_trainer.load_global_models",
+                       return_value=fake_global):
+                result = predict(csv_path, stub_result)
+            self.assertEqual(result["status"], "ok_global")
+            self.assertIsInstance(result.get("clf_5d_prob_up"), float)
 
     def test_predict_return_pct_is_float_or_none(self):
         # Regression outputs must be floats so the display can format them

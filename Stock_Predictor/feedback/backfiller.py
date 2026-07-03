@@ -5,11 +5,14 @@ Solves the cold-start problem: the feedback loop needs N resolved
 predictions before bias correction and ML calibration activate, but
 you would normally have to wait N real runs to accumulate that data.
 
-The backfill works backwards through the TEST SPLIT of features.csv
-(the last 20% of rows — genuinely out-of-sample data the model was
-never trained on) and replays the model on every historical day where
-forward-return labels are known.  Actual prices at all 8 horizons are
-derived by looking ahead in the price DataFrame.
+The backfill replays predictions over the last 20% of features.csv.
+Because the PERSISTED models are fitted on ALL labelled rows (see
+ml/trainer.py — evaluation is walk-forward CV, deployment uses full
+history), replaying them here would be in-sample and inflate the
+bootstrap accuracy stats. So the backfiller fits its own temporary
+replay models on the FIRST 80% only, keeping the replayed 20%
+genuinely out-of-sample. Actual prices at all 8 horizons are derived
+by looking ahead in the price DataFrame.
 
 Each synthetic row is tagged  mode="backfill" / provider="backfill"
 so it can be filtered separately in accuracy.py if desired, but by
@@ -37,8 +40,14 @@ import uuid
 import numpy as np
 import pandas as pd
 
+from sklearn.ensemble import (
+    GradientBoostingClassifier, GradientBoostingRegressor,
+    RandomForestClassifier, RandomForestRegressor,
+)
+
 from config import FEEDBACK_DIR, FEEDBACK_MIN_SAMPLES, BACKFILL_MIN_TEST_ROWS, ML_MODELS_DIR
 from feedback.tracker import COLUMNS
+from ml.trainer import _GB_PARAMS, _RF_PARAMS
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +172,28 @@ def backfill_historical_predictions(
 
     # ── Prepare feature columns available in test_df ───────────── #
     avail_feat_cols = [c for c in feature_cols if c in test_df.columns]
+
+    # ── Fit temporary replay models on the FIRST 80% only ──────── #
+    # The persisted models in trainer_result are fitted on all rows,
+    # so replaying them over the last 20% would be in-sample and
+    # inflate the bootstrap stats. Refit here (same hyper-parameters)
+    # so the replayed window stays genuinely out-of-sample. Backfill
+    # only runs on cold-start, so the extra fits are a one-off cost.
+    train_df = feat_df.iloc[:split_idx]
+    X_tr = train_df[avail_feat_cols].ffill().bfill().fillna(0.0)
+    replay_models: dict = {}
+    try:
+        for h in (5, 21):
+            y_clf = train_df[f"direction_{h}d"].values
+            y_reg = train_df[f"return_{h}d"].values
+            replay_models[f"clf_{h}d"]    = GradientBoostingClassifier(**_GB_PARAMS).fit(X_tr, y_clf)
+            replay_models[f"clf_{h}d_rf"] = RandomForestClassifier(**_RF_PARAMS).fit(X_tr, y_clf)
+            replay_models[f"reg_{h}d"]    = GradientBoostingRegressor(**_GB_PARAMS).fit(X_tr, y_reg)
+            replay_models[f"reg_{h}d_rf"] = RandomForestRegressor(**_RF_PARAMS).fit(X_tr, y_reg)
+    except Exception as exc:
+        logger.warning("Backfill: could not fit replay models for %s: %s", ticker, exc)
+        return 0
+    models = replay_models
 
     # ── Replay model on each test-split row ────────────────────── #
     new_rows: list[dict] = []

@@ -8,9 +8,10 @@ Returns an 'analyst_data' dict consumed by both the terminal display
 and the LLM prompt-builder.
 """
 
-import yfinance as yf
 import datetime
 import pandas as pd
+
+from data import market_data
 
 
 # Module-level constant — defined once rather than re-created on every call.
@@ -42,7 +43,7 @@ def fetch_analyst_data(ticker: str) -> dict:
       "earnings_dates"    — pd.DataFrame | None  (upcoming / recent earnings)
     """
 
-    stock = yf.Ticker(ticker)
+    stock = market_data.get_ticker(ticker)
     result: dict = {}
 
     # ------------------------------------------------------------------ #
@@ -50,12 +51,9 @@ def fetch_analyst_data(ticker: str) -> dict:
     # ------------------------------------------------------------------ #
     # Yahoo Finance provides a pre-aggregated consensus string such as
     # "buy", "hold", "sell", "strong_buy", "underperform".
-    # ETFs don't have a quoteSummary endpoint, so stock.info may raise a
-    # 404 — fall back to "N/A" in that case.
-    try:
-        result["recommendation_key"] = stock.info.get("recommendationKey", "N/A")
-    except Exception:
-        result["recommendation_key"] = "N/A"
+    # ETFs don't have a quoteSummary endpoint — get_info() returns {}
+    # in that case, so we fall back to "N/A".
+    result["recommendation_key"] = market_data.get_info(ticker).get("recommendationKey") or "N/A"
 
     # ------------------------------------------------------------------ #
     # 2. Price target summary (mean / low / high / count)
@@ -115,7 +113,7 @@ def fetch_analyst_data(ticker: str) -> dict:
     # 4. Recent news headlines (up to 10 articles)
     # ------------------------------------------------------------------ #
     try:
-        news_raw = stock.news or []
+        news_raw = market_data.get_news(ticker)
         headlines = []
         for item in news_raw[:10]:
             # yfinance >= 0.2.50 wraps fields inside a nested "content" dict;
@@ -141,8 +139,9 @@ def fetch_analyst_data(ticker: str) -> dict:
     # 5. Earnings calendar (upcoming / most recent earnings date)
     # ------------------------------------------------------------------ #
     try:
-        cal = stock.earnings_dates
+        cal = market_data.get_earnings_dates(ticker)
         if cal is not None and not cal.empty:
+            cal = cal.copy()  # keep the cached DataFrame pristine
             idx = pd.to_datetime(cal.index)
             if idx.tz is not None:
                 idx = idx.tz_convert(None)
@@ -182,10 +181,8 @@ def fetch_analyst_data(ticker: str) -> dict:
     # VIX 20-30 → elevated uncertainty
     # VIX < 20  → calm / risk-on regime
     try:
-        vix_ticker = yf.Ticker("^VIX")
-        vix_hist   = vix_ticker.history(period="5d", interval="1d")
-        if vix_hist is not None and not vix_hist.empty:
-            vix_val = float(vix_hist["Close"].dropna().iloc[-1])
+        vix_val = market_data.get_vix_latest()
+        if vix_val is not None:
             if vix_val >= 30:
                 vix_regime = "HIGH FEAR (>30) — risk-off; widen stops, reduce position size"
             elif vix_val >= 20:

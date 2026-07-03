@@ -321,6 +321,27 @@ def build_calibration_table(ticker: str) -> dict:
         if buckets:
             result[h_label] = buckets
 
+        # ── Decision-threshold tuning (additive key) ─────────────── #
+        # With enough resolved rows, grid-search the probability cutoff
+        # that maximises balanced accuracy instead of assuming 0.5.
+        # The actual direction is reconstructed from what the model
+        # predicted (prob >= 0.5) and whether that call was correct.
+        if len(sub) >= 30:
+            predicted_up = sub[prob_col] >= 0.5
+            was_correct  = sub[correct_col] >= 0.5
+            actual_up    = predicted_up == was_correct
+            if actual_up.nunique() == 2:             # need both classes
+                best_t, best_bacc = 0.5, -1.0
+                for t in [x / 100 for x in range(35, 66)]:
+                    pred = sub[prob_col] >= t
+                    tpr = float((pred & actual_up).sum())  / max(int(actual_up.sum()), 1)
+                    tnr = float((~pred & ~actual_up).sum()) / max(int((~actual_up).sum()), 1)
+                    bacc = (tpr + tnr) / 2
+                    if bacc > best_bacc:
+                        best_t, best_bacc = t, bacc
+                result[f"threshold_{h_label}"] = round(best_t, 2)
+                result[f"threshold_{h_label}_balanced_acc"] = round(best_bacc, 4)
+
     if result:
         cal_path = os.path.join(ML_MODELS_DIR, ticker.upper(), "calibration.json")
         os.makedirs(os.path.dirname(cal_path), exist_ok=True)

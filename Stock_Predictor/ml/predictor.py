@@ -14,9 +14,11 @@ Expected models (loaded from models/{TICKER}/ by trainer.load_or_train):
 import os
 import json
 import logging
+import math
 import pandas as pd
 
 from ml.trainer import FEATURE_COLS
+from ml import global_trainer
 
 logger = logging.getLogger(__name__)
 
@@ -50,51 +52,69 @@ def predict(csv_path: str, trainer_result: dict) -> dict:
     }
     """
     status = trainer_result.get("status", "")
-    if status == "insufficient_data" or not trainer_result.get("models"):
+    has_local = bool(trainer_result.get("models")) and status != "insufficient_data"
+
+    # Pooled cross-ticker models (models/_GLOBAL/, trained via
+    # --retrain-global). Blended with the per-ticker models when both
+    # exist; used alone for tickers whose history is too short to train.
+    global_set = global_trainer.load_global_models()
+
+    if not has_local and not global_set:
         return _empty(status or "insufficient_data")
 
-    models  = trainer_result["models"]
-    metrics = trainer_result.get("metrics", {})
+    models  = trainer_result.get("models", {}) if has_local else {}
+    metrics = trainer_result.get("metrics", {}) if has_local else {}
     trained_rows = trainer_result.get("trained_on_rows", 0)
 
     # Build feature vector using the feature list from training time.
     # This must match what the persisted models were trained on.
-    train_features = trainer_result.get("features") or FEATURE_COLS
-    x = _build_feature_vector(csv_path, train_features)
-    if x is None:
-        return _empty("error")
+    x = None
+    if has_local:
+        train_features = trainer_result.get("features") or FEATURE_COLS
+        x = _build_feature_vector(csv_path, train_features)
+        if x is None and not global_set:
+            return _empty("error")
+
+    x_global = _build_feature_vector(csv_path, global_set["features"]) if global_set else None
+
+    if not has_local:
+        # Short-history ticker: serve pure global predictions and surface
+        # the pooled CV metrics so the judge's accuracy gating still works.
+        metrics = dict(global_set.get("metrics", {}))
 
     result = {
         "metrics":         metrics,
         "trained_on_rows": trained_rows,
-        "status":          "ok",
+        "status":          "ok" if has_local else "ok_global",
+        "global_blend":    bool(global_set),
     }
 
+    cal_path = os.path.join(os.path.dirname(csv_path), "..", "..", "models",
+                            os.path.basename(os.path.dirname(csv_path)), "calibration.json")
+    cal_path = os.path.normpath(cal_path)
+
     for h in (5, 21):
-        clf_gb = models.get(f"clf_{h}d")
-        clf_rf = models.get(f"clf_{h}d_rf")
-        reg_gb = models.get(f"reg_{h}d")
-        reg_rf = models.get(f"reg_{h}d_rf")
+        prob_local  = _ensemble_prob(models, x, h) if x is not None else None
+        prob_global = _ensemble_prob(global_set["models"], x_global, h) if (global_set and x_global is not None) else None
 
-        if clf_gb is not None:
-            prob_gb = float(clf_gb.predict_proba(x)[0][1])
-            # Average with RF ensemble if available
-            if clf_rf is not None:
-                prob_rf  = float(clf_rf.predict_proba(x)[0][1])
-                prob_up  = round((prob_gb + prob_rf) / 2.0, 4)
-            else:
-                prob_up  = round(prob_gb, 4)
+        prob_up = _blend(
+            prob_local,  _metric_acc(metrics, h) if has_local else None,
+            prob_global, _metric_acc(global_set.get("metrics", {}), h) if global_set else None,
+        )
 
-            direction = "UP" if prob_up >= 0.5 else "DOWN"
+        if prob_up is not None:
+            prob_up = round(prob_up, 4)
 
             # Calibrate using empirical lookup table if it exists
-            cal_path = os.path.join(os.path.dirname(csv_path), "..", "..", "models",
-                                    os.path.basename(os.path.dirname(csv_path)), "calibration.json")
-            cal_path = os.path.normpath(cal_path)
             cal_prob_up = _apply_calibration(prob_up, cal_path, h)
 
+            # Decision threshold: tuned per-horizon from resolved feedback
+            # (stored in calibration.json) — falls back to 0.5.
+            threshold = _tuned_threshold(cal_path, h)
+            direction = "UP" if cal_prob_up >= threshold else "DOWN"
+
             # Confidence label based on distance from the decision boundary
-            confidence_margin = abs(cal_prob_up - 0.5)
+            confidence_margin = abs(cal_prob_up - threshold)
             if confidence_margin > 0.20:
                 confidence = "HIGH"
             elif confidence_margin > 0.10:
@@ -112,18 +132,83 @@ def predict(csv_path: str, trainer_result: dict) -> dict:
             result[f"clf_{h}d_direction"]       = "N/A"
             result[f"clf_{h}d_confidence"]      = "N/A"
 
-        if reg_gb is not None:
-            ret_gb = float(reg_gb.predict(x)[0]) * 100
-            if reg_rf is not None:
-                ret_rf = float(reg_rf.predict(x)[0]) * 100
-                ret_pct = (ret_gb + ret_rf) / 2.0
-            else:
-                ret_pct = ret_gb
-            result[f"reg_{h}d_return_pct"] = round(ret_pct, 2)
-        else:
-            result[f"reg_{h}d_return_pct"] = None
+        ret_local  = _ensemble_return(models, x, h) if x is not None else None
+        ret_global = _ensemble_return(global_set["models"], x_global, h) if (global_set and x_global is not None) else None
+        ret_pct = _blend(
+            ret_local,  _metric_acc(metrics, h) if has_local else None,
+            ret_global, _metric_acc(global_set.get("metrics", {}), h) if global_set else None,
+        )
+        result[f"reg_{h}d_return_pct"] = round(ret_pct, 2) if ret_pct is not None else None
 
     return result
+
+
+# ------------------------------------------------------------------ #
+# Blending helpers
+# ------------------------------------------------------------------ #
+
+def _ensemble_prob(models: dict, x, h: int) -> "float | None":
+    """GBM+RF averaged probability-of-up for horizon *h* (None if absent)."""
+    clf_gb = models.get(f"clf_{h}d")
+    if clf_gb is None:
+        return None
+    prob = float(clf_gb.predict_proba(x)[0][1])
+    clf_rf = models.get(f"clf_{h}d_rf")
+    if clf_rf is not None:
+        prob = (prob + float(clf_rf.predict_proba(x)[0][1])) / 2.0
+    return prob
+
+
+def _ensemble_return(models: dict, x, h: int) -> "float | None":
+    """GBM+RF averaged expected % return for horizon *h* (None if absent)."""
+    reg_gb = models.get(f"reg_{h}d")
+    if reg_gb is None:
+        return None
+    ret = float(reg_gb.predict(x)[0]) * 100
+    reg_rf = models.get(f"reg_{h}d_rf")
+    if reg_rf is not None:
+        ret = (ret + float(reg_rf.predict(x)[0]) * 100) / 2.0
+    return ret
+
+
+def _metric_acc(metrics: dict, h: int) -> "float | None":
+    """Walk-forward CV accuracy for horizon *h* (None when missing/NaN)."""
+    acc = metrics.get(f"clf_{h}d_accuracy")
+    if isinstance(acc, (int, float)) and not math.isnan(acc):
+        return float(acc)
+    return None
+
+
+def _blend(v_local, acc_local, v_global, acc_global) -> "float | None":
+    """
+    Accuracy-weighted blend of the per-ticker and pooled predictions.
+    Weight = CV accuracy edge over coin-flip (floored at a small epsilon
+    so a model is never zeroed out entirely on tiny samples). Falls back
+    to whichever value exists, or a 50/50 mix when accuracies are unknown.
+    """
+    if v_local is None and v_global is None:
+        return None
+    if v_local is None:
+        return v_global
+    if v_global is None:
+        return v_local
+    w_local  = max((acc_local  or 0.5) - 0.5, 0.02)
+    w_global = max((acc_global or 0.5) - 0.5, 0.02)
+    return (w_local * v_local + w_global * v_global) / (w_local + w_global)
+
+
+def _tuned_threshold(cal_path: str, horizon: int) -> float:
+    """Per-horizon decision threshold from calibration.json (default 0.5)."""
+    try:
+        if os.path.isfile(cal_path):
+            with open(cal_path) as f:
+                cal = json.load(f)
+            t = cal.get(f"threshold_{horizon}d")
+            if isinstance(t, (int, float)) and 0.3 <= t <= 0.7:
+                return float(t)
+    except Exception:
+        pass
+    return 0.5
 
 
 # ------------------------------------------------------------------ #
