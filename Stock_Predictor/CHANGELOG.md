@@ -79,6 +79,14 @@ whole market for fresh candidate tickers.
   `reports/discovery/`.
 - Watchlist/ticker files now support **inline `#` comments**.
 - Support/resistance pivot detection vectorised (was an O(n·window) Python loop).
+- **Backtest harness** (`analysis/backtester.py`, `--backtest` / `--backtest-broad`):
+  replays the technical lens weekly across full price history (leak-free — indicators are
+  past-only rolling computations; 52-week stats reconstructed from trailing 252-bar
+  extremes) and reports forward returns by score bucket, hit rates, Spearman rank IC,
+  and excess return vs SPY, with a full-vs-thin signal split. First run on the live
+  watchlist showed the ≥70 bucket earning a 60–64% hit rate vs ~45–49% for lower buckets.
+  Fundamental/valuation lenses are deliberately NOT replayed (current-snapshot data would
+  be look-ahead bias) and every run prints its survivorship/overlap caveats.
 - **Sector-relative valuation** (`data/sector_data.py`): trailing P/E, forward P/E and P/B
   are now graded against the stock's own sector-peer medians (top ~100 US names by market
   cap, one key-free Yahoo screener request per sector, cached 7 days, with stale-cache and

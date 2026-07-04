@@ -162,6 +162,24 @@ def parse_args() -> argparse.Namespace:
         metavar = "USD",
         help    = "Minimum market cap filter for discovered tickers (default 100000000)",
     )
+    parser.add_argument(
+        "--backtest",
+        action  = "store_true",
+        default = False,
+        help    = (
+            "Replay the rule-based judge's TECHNICAL lens weekly across each\n"
+            "ticker's history and measure whether scores predicted 21d/63d\n"
+            "forward returns (bucket table + rank IC). Uses --ticker/--file if\n"
+            "given, else tickers.txt + watchlist.txt. Add --backtest-broad to\n"
+            "pool ~110 large caps across all sectors for statistical power."
+        ),
+    )
+    parser.add_argument(
+        "--backtest-broad",
+        action  = "store_true",
+        default = False,
+        help    = "Extend --backtest universe with the top ~10 US names per sector",
+    )
 
     args = parser.parse_args()
 
@@ -169,9 +187,10 @@ def parse_args() -> argparse.Namespace:
     # (--resolve/--backfill default to tickers.txt, --retrain-global and
     # --discover need none) do not.
     if not any((args.ticker, args.file, args.resolve, args.backfill,
-                args.retrain_global, args.discover)):
+                args.retrain_global, args.discover, args.backtest)):
         parser.error("one of --ticker/--file (or a standalone mode: "
-                     "--resolve, --backfill, --retrain-global, --discover) is required")
+                     "--resolve, --backfill, --retrain-global, --discover, "
+                     "--backtest) is required")
     return args
 
 
@@ -558,6 +577,29 @@ if __name__ == "__main__":
                 "[yellow]Not enough pooled data to train — run a few normal "
                 "analyses first so reports/*/features.csv exist.[/yellow]"
             )
+        sys.exit(0)
+
+    # ── --backtest mode: validate the technical lens and exit ──── #
+    if args.backtest:
+        from analysis.backtester import run_backtest
+        bt_tickers: list[str] = []
+        if args.ticker:
+            bt_tickers = [args.ticker.upper().strip()]
+        elif args.file:
+            bt_tickers = _read_tickers_file(args.file)
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            for fname in ("tickers.txt", "watchlist.txt"):
+                path = os.path.join(base_dir, fname)
+                if os.path.isfile(path):
+                    try:
+                        bt_tickers += _read_tickers_file(path)
+                    except SystemExit:
+                        pass    # empty watchlist etc. — not fatal here
+        if not bt_tickers and not args.backtest_broad:
+            console.print("[yellow]No tickers to backtest.[/yellow]")
+            sys.exit(0)
+        run_backtest(console, bt_tickers, broad=args.backtest_broad)
         sys.exit(0)
 
     # ── --discover mode: scan market for new candidates and exit ─ #

@@ -242,6 +242,35 @@ Once trained (saved under `models/_GLOBAL/`), the predictor automatically:
 
 Re-run it occasionally (e.g. after adding tickers or monthly) to refresh the pool.
 
+### Step 7 — Backtest the technical lens (`--backtest`)
+
+Answers "do the judge's technical scores actually predict returns?" without waiting
+months for the live feedback loop. It replays the technical lens weekly across each
+ticker's full history (leak-free — every indicator is a past-only rolling computation),
+then measures realised 21-day and 63-day forward returns by score bucket, plus a
+Spearman rank IC and an excess-return comparison vs SPY over the identical windows:
+
+```bash
+# Backtest your tickers.txt + watchlist.txt
+python main.py --backtest
+
+# Pool ~110 large caps across all 11 sectors for statistical power
+python main.py --backtest --backtest-broad
+
+# Backtest a specific ticker or file
+python main.py --ticker AAPL --backtest
+```
+
+Every observation is written to `reports/backtest/backtest_technical_{DATE}.csv` for
+your own analysis. Scores are split into "full-signal" vs "thin-signal" (young tickers
+with missing SMA-200/52-week data) so you can see how much to trust discovery-style
+thin scores.
+
+**Honest limits, printed with every run:** only the technical lens is replayed
+(fundamental/valuation lenses use current-snapshot data — replaying those would be
+look-ahead bias); today's universe carries survivorship bias; overlapping weekly
+windows mean the effective sample size is smaller than N.
+
 ### Output
 
 Results are printed to the terminal and saved under `reports/{TICKER}_{DATE}/`:
