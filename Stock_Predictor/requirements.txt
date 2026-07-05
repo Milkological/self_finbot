@@ -13,3 +13,13 @@ python-dotenv>=1.0.0
 reportlab>=4.0.0
 json-repair>=0.18.0
 scikit-learn>=1.4.0
+# lxml: yfinance scrapes the earnings calendar via pandas.read_html, which
+# needs an HTML parser. Without it, earnings dates + Surprise(%) features
+# are silently unavailable (they degrade to NaN, but you lose the signal).
+lxml>=5.0.0
+# Pillow: chart image handling in the PDF generator (flatten to RGB).
+pillow>=10.0.0
+# vaderSentiment: offline lexicon sentiment scorer. Makes headline sentiment
+# work with zero API keys (the LLM-free path); without it --no-llm runs would
+# have a permanent 0.0 neutral sentiment.
+vaderSentiment>=3.3.2

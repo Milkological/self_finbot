@@ -180,6 +180,62 @@ def parse_args() -> argparse.Namespace:
         default = False,
         help    = "Extend --backtest universe with the top ~10 US names per sector",
     )
+    parser.add_argument(
+        "--doctor",
+        action  = "store_true",
+        default = False,
+        help    = (
+            "Run an environment & connectivity health check (LLM providers,\n"
+            "Yahoo, SEC EDGAR, lxml, ML models, feedback CSVs) and exit.\n"
+            "Answers 'why is nothing happening?' in one command."
+        ),
+    )
+    parser.add_argument(
+        "--build-universe",
+        action  = "store_true",
+        default = False,
+        help    = (
+            "Build a broad training universe (~10 liquid large caps per sector)\n"
+            "under reports/_universe/, then retrain the pooled global model on it.\n"
+            "One-off, slow (network-heavy) batch; resumable. Biggest ML data lever."
+        ),
+    )
+    parser.add_argument(
+        "--universe-per-sector",
+        type    = int,
+        default = 10,
+        metavar = "N",
+        help    = "Tickers per sector for --build-universe (default 10 ≈ 110 total)",
+    )
+    parser.add_argument(
+        "--universe-force",
+        action  = "store_true",
+        default = False,
+        help    = "Rebuild every universe ticker even if its features.csv is fresh",
+    )
+    parser.add_argument(
+        "--portfolio",
+        action  = "store_true",
+        default = False,
+        help    = (
+            "Paper-trading scoreboard: replay resolved BUY/STRONG BUY predictions\n"
+            "as paper trades and report win rate + return vs SPY. Run --resolve first."
+        ),
+    )
+    parser.add_argument(
+        "--horizon",
+        type    = str,
+        default = "1m",
+        metavar = "H",
+        help    = "Hold horizon for --portfolio: 1w/2w/3w/1m/3m/6m/9m/12m (default 1m)",
+    )
+    parser.add_argument(
+        "--provider",
+        type    = str,
+        default = None,
+        metavar = "NAME",
+        help    = "Filter --portfolio to one provider (e.g. rule_based for the LLM-free scoreboard)",
+    )
 
     args = parser.parse_args()
 
@@ -187,10 +243,11 @@ def parse_args() -> argparse.Namespace:
     # (--resolve/--backfill default to tickers.txt, --retrain-global and
     # --discover need none) do not.
     if not any((args.ticker, args.file, args.resolve, args.backfill,
-                args.retrain_global, args.discover, args.backtest)):
+                args.retrain_global, args.discover, args.backtest, args.doctor,
+                args.build_universe, args.portfolio)):
         parser.error("one of --ticker/--file (or a standalone mode: "
                      "--resolve, --backfill, --retrain-global, --discover, "
-                     "--backtest) is required")
+                     "--backtest, --doctor, --build-universe, --portfolio) is required")
     return args
 
 
@@ -398,11 +455,29 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
                     "description":        build_company_description(info, analyst_data),
                 }
         else:
+            # Live progress: the LLM step is the longest, and a dead provider
+            # used to make it look frozen. This callback surfaces which
+            # provider is on which wave so the spinner always shows motion.
+            def _llm_progress(pname: str, stage: str) -> None:
+                try:
+                    progress.update(
+                        task,
+                        description=f"[7/{len(steps)}] LLM · {pname} · {stage}",
+                    )
+                except Exception:
+                    pass
+
             llm_result = get_llm_analysis(
                 ticker, info, technical, fundamental, statistical, analyst_data, ml_result,
                 accuracy_context=accuracy_context,
                 accuracy_context_map=accuracy_context_map,
+                progress_cb=_llm_progress,
             )
+            # Surface per-provider failures visibly (previously silent).
+            for pname, emsg in (llm_result.get("provider_errors") or {}).items():
+                console.log(f"[yellow]LLM provider unavailable — {pname}: {emsg}[/yellow]")
+            if llm_result.get("llm_failed"):
+                console.log("[yellow]All LLM providers failed — showing rule-based judge instead.[/yellow]")
             # Always attach the rule-based judge so it can be displayed as a
             # standalone "second opinion" panel even when the LLM ran successfully.
             try:
@@ -459,7 +534,11 @@ def run_pipeline(ticker: str, skip_llm: bool = False, retrain: bool = False) -> 
 
     # ---- Save feedback prediction — one row per active provider ---- #
     try:
-        if mode_str == "llm" and llm_result.get("providers"):
+        # When every LLM provider failed, get_llm_analysis returns the
+        # rule-based analysis (llm_failed=True). Record it as a rule_based
+        # row so the fallback still feeds the accuracy loop, rather than
+        # dropping the prediction because the (empty) providers dict exists.
+        if mode_str == "llm" and llm_result.get("providers") and not llm_result.get("llm_failed"):
             for pname, presult in llm_result["providers"].items():
                 # Skip providers that failed entirely (no LLM output produced)
                 if not presult.get("llm_available", True):
@@ -554,6 +633,27 @@ def _read_tickers_file(path: str) -> list[str]:
 
 if __name__ == "__main__":
     args = parse_args()
+
+    # ── --doctor mode: environment & connectivity check and exit ─ #
+    if args.doctor:
+        from diagnostics import run_doctor
+        sys.exit(run_doctor(console))
+
+    # ── --build-universe mode: build training data + retrain ───── #
+    if args.build_universe:
+        from ml.universe_builder import build_universe
+        build_universe(
+            console,
+            per_sector = args.universe_per_sector,
+            force      = args.universe_force,
+        )
+        sys.exit(0)
+
+    # ── --portfolio mode: paper-trading scoreboard and exit ────── #
+    if args.portfolio:
+        from portfolio.simulator import run_portfolio
+        run_portfolio(console, horizon=args.horizon, provider=args.provider)
+        sys.exit(0)
 
     # ── --retrain-global mode: train pooled model and exit ─────── #
     if args.retrain_global:

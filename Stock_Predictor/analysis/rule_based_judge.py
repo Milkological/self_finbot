@@ -780,6 +780,23 @@ def run_rule_based_judge(
             _BASE_W["fundamental"], _BASE_W["technical"],
             _BASE_W["valuation"],   _BASE_W["risk"],
         )
+
+    # ── Cap-aware technical de-weighting (backtest-evidenced) ──── #
+    # The technical lens backtested with predictive skill on volatile /
+    # smaller names (rank IC +0.067) but INVERTED on large caps (IC
+    # −0.039) — momentum-style scoring behaves like a dip-buying signal
+    # on mega caps. So above ~$10B market cap we halve the technical
+    # weight and redistribute it to the fundamental & valuation lenses
+    # (which are cap-agnostic). Discovery-style small caps are unaffected.
+    mktcap = info.get("marketCap")
+    cap_adjusted = False
+    if isinstance(mktcap, (int, float)) and mktcap > 10e9:
+        shed = w_tech * 0.5
+        w_tech -= shed
+        w_fund += shed * 0.5
+        w_val  += shed * 0.5
+        cap_adjusted = True
+
     composite = (
         w_fund * fund["score"] +
         w_tech * tech["score"] +
@@ -846,7 +863,11 @@ def run_rule_based_judge(
             )
             composite += ml_adjust
 
-    effective_weights = {"fundamental": w_fund, "technical": w_tech, "valuation": w_val, "risk": w_risk}
+    effective_weights = {
+        "fundamental": round(w_fund, 4), "technical": round(w_tech, 4),
+        "valuation": round(w_val, 4), "risk": round(w_risk, 4),
+        "cap_adjusted": cap_adjusted,
+    }
 
     composite = round(composite, 1)
 
@@ -1079,6 +1100,61 @@ def run_rule_based_analysis(
         if s.get("points", 0) == 0
     ][:3]
 
+    # ── Real sentiment / macro verdicts + catalysts (no LLM needed) ─── #
+    # These used to be hardcoded "N/A" stubs. They are all derivable from
+    # data already fetched, so --no-llm reports are no longer half-empty.
+    sentiment = (ml_result or {}).get("sentiment", {}) or {}
+    s_score = sentiment.get("overall_score", 0.0) or 0.0
+    s_label = sentiment.get("label", "NEUTRAL")
+    s_summary = sentiment.get("summary", "")
+    if s_summary:
+        sentiment_verdict = (
+            f"Headline sentiment {s_label} (score {s_score:+.2f}). {s_summary}"
+        )
+    elif abs(s_score) < 0.001:
+        sentiment_verdict = "Headline sentiment NEUTRAL — no directional news signal."
+    else:
+        sentiment_verdict = f"Headline sentiment {s_label} (score {s_score:+.2f})."
+
+    # Macro verdict from VIX regime + volatility regime + earnings proximity.
+    vix_val   = analyst_data.get("vix", {}).get("value")
+    vol_regime = statistical.get("volatility", {}).get("vol_regime", "")
+    macro_bits = []
+    if vix_val is not None:
+        macro_bits.append(f"VIX {vix_val:.1f} — {vix_regime}")
+    else:
+        macro_bits.append(f"Volatility regime: {vix_regime}")
+    if vol_regime:
+        macro_bits.append(f"stock vol {vol_regime}")
+    if analyst_data.get("earnings_within_5d"):
+        macro_bits.append("EARNINGS within ~5 trading days (elevated event risk)")
+    elif analyst_data.get("earnings_within_21d"):
+        macro_bits.append("earnings within ~1 month")
+    macro_verdict = " | ".join(macro_bits) + "."
+
+    # Catalysts: forward-looking, rule-derived from data in hand. Capped at 4.
+    catalysts: list[str] = []
+    next_earn = analyst_data.get("next_earnings_date")
+    if next_earn:
+        catalysts.append(f"Next earnings: {next_earn}")
+    recs = analyst_data.get("recommendations", []) or []
+    n_up = sum(1 for r in recs[:10] if "Upgrade" in str(r.get("action", "")))
+    if n_up >= 1:
+        catalysts.append(f"{n_up} recent analyst upgrade(s)")
+    pt = analyst_data.get("price_target") or {}
+    mean_t = pt.get("mean")
+    if mean_t and price and mean_t > price * 1.10:
+        catalysts.append(f"Analyst mean target ${mean_t:.2f} implies "
+                         f"{(mean_t/price-1)*100:.0f}% upside")
+    latest = technical.get("latest", {})
+    hi_52 = info.get("fiftyTwoWeekHigh")
+    if hi_52 and price and price >= hi_52 * 0.97:
+        catalysts.append("Trading near 52-week high (momentum breakout zone)")
+    vol_ratio = latest.get("Volume_ratio") or technical.get("latest", {}).get("Volume_ratio")
+    if s_label == "POSITIVE":
+        catalysts.append("Positive news flow in recent headlines")
+    catalysts = catalysts[:4]
+
     # ── Rule-based stubs for the 12 sub-agents ───────────────────── #
     fund_score = rbj.get("fundamental", {})
     tech_score = rbj.get("technical",   {})
@@ -1116,12 +1192,17 @@ def run_rule_based_analysis(
             "_source":  "rule_based",
         },
         "sentiment_analyst": {
-            "sentiment_bias": "NEUTRAL", "market_mood": "NEUTRAL",
-            "narrative": "Rule-based mode — no LLM sentiment analysis.",
-            "news_momentum": "STABLE", "high_impact_headlines": [],
-            "sentiment_score": 0.0, "behavioural_pressure": "NEUTRAL",
+            "sentiment_bias": s_label,
+            "market_mood": s_label,
+            "narrative": s_summary or "Offline headline sentiment (VADER).",
+            "news_momentum": "STABLE",
+            "high_impact_headlines": [
+                str(h.get("title", "")) for h in (analyst_data.get("news", []) or [])[:3]
+            ],
+            "sentiment_score": round(s_score, 4),
+            "behavioural_pressure": s_label,
             "earnings_risk_flag": analyst_data.get("earnings_within_5d", False),
-            "findings": [], "verdict": "Sentiment analysis unavailable (rule-based mode).",
+            "findings": [], "verdict": sentiment_verdict,
             "_source": "rule_based",
         },
         "news_analyst": {
@@ -1303,13 +1384,13 @@ def run_rule_based_analysis(
         "key_bull_case":      key_bull,
         "key_bear_case":      key_bear,
         "key_risks":          key_risks,
-        "catalysts":          [],
+        "catalysts":          catalysts,
         "summary":            rbj.get("summary", ""),
         "technical_verdict":  rbj.get("technical_verdict",  ""),
         "fundamental_verdict":rbj.get("fundamental_verdict",""),
         "valuation_verdict":  rbj.get("valuation_verdict",  ""),
-        "sentiment_verdict":  "N/A (rule-based mode — no LLM sentiment analysis).",
-        "macro_verdict":      "N/A (rule-based mode — no LLM macro analysis).",
+        "sentiment_verdict":  sentiment_verdict,
+        "macro_verdict":      macro_verdict,
         "alternative_pick":   None,
         "alternative_reason": None,
         "agents":             stub_agents,

@@ -1,0 +1,35 @@
+# requirements.lock — known-good pinned versions (snapshot 2026-07-05, Python 3.14).
+#
+# WHY THIS EXISTS: requirements.txt uses version RANGES so fresh installs pick up
+# compatible updates. But drift bites — the reportlab 4.5 / Python 3.14 / Pillow 12
+# combination silently broke PDF generation. This file records an exact set that is
+# known to work end-to-end (192 tests passing, full pipeline verified).
+#
+# USAGE:
+#   Reproduce the exact environment:   pip install -r requirements.lock
+#   Normal / upgrade-friendly install: pip install -r requirements.txt
+#
+# Regenerate after a verified upgrade:  pip freeze > requirements.lock  (then prune noise)
+
+yfinance==1.4.1
+requests==2.34.2
+openai==2.38.0
+google-genai==2.7.0
+pandas==3.0.3
+numpy==2.4.6
+scipy==1.17.1
+matplotlib==3.10.9
+rich==15.0.0
+python-dotenv==1.2.2
+reportlab==4.5.1
+json-repair==0.59.10
+scikit-learn==1.8.0
+pillow==12.2.0
+
+# Transitive but worth pinning (yfinance's HTTP + protobuf for google-genai):
+curl_cffi==0.15.0
+protobuf==7.35.0
+
+# Needed for yfinance earnings-calendar scraping (Surprise% features). Not
+# installed in the snapshot env above; pin when you add it:
+# lxml==5.3.0

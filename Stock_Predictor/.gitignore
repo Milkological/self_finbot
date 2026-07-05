@@ -131,3 +131,10 @@ coverage.xml
 
 
 feedback/*.csv
+
+
+# ---------------------------------------------------------------------------
+# Local-only planning docs
+# ---------------------------------------------------------------------------
+# ROADMAP.md is a personal working backlog — keep it local, don't publish it.
+ROADMAP.md

@@ -112,6 +112,23 @@ LLM_MAX_TOKENS_AZURE: int    = int(os.getenv("LLM_MAX_TOKENS_AZURE",      "8000"
 LLM_MAX_TOKENS_GOOGLE: int   = int(os.getenv("LLM_MAX_TOKENS_GOOGLE",     "8192"))
 LLM_MAX_TOKENS_DEEPSEEK: int = int(os.getenv("LLM_MAX_TOKENS_DEEPSEEK",   "8000"))
 
+# Per-request network timeout (seconds) and retry budget for every LLM
+# provider call. The SDK defaults (600s timeout, 2 retries) mean an
+# unreachable or hanging provider can stall a run for many minutes; a
+# tight timeout + a per-provider circuit breaker (see analysis/llm_analysis.py)
+# make a dead provider fail fast and hand off to the rule-based judge.
+# 60s leaves headroom for legitimate slow generations (the Judge agent can
+# emit up to 8000 tokens from a large prompt); a tighter bound risks timing
+# out a healthy provider mid-completion.
+LLM_TIMEOUT: float     = float(os.getenv("LLM_TIMEOUT",     "60"))
+# Default 0: the circuit breaker + per-agent fallback + rule-based fallback
+# already provide resilience, so per-request retries just double the wait on
+# an unreachable provider. Raise to 1 if you see transient single-agent blips.
+LLM_MAX_RETRIES: int   = int(os.getenv("LLM_MAX_RETRIES",   "0"))
+# Consecutive connection-class failures before a provider's remaining
+# agents are skipped for the rest of the run.
+LLM_CIRCUIT_THRESHOLD: int = int(os.getenv("LLM_CIRCUIT_THRESHOLD", "2"))
+
 # ------------------------------------------------------------------
 # Feedback loop settings
 # ------------------------------------------------------------------

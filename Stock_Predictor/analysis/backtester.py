@@ -124,8 +124,37 @@ def _signals_asof(ind: pd.DataFrame, i: int) -> dict:
     return sig
 
 
+def _fundamental_score_asof(edgar_row) -> "float | None":
+    """
+    Map a point-in-time EDGAR feature row to a 0–100 fundamental score,
+    in the same spirit as the live fundamental lens (growth + margins +
+    acceleration), so it can be backtested against forward returns.
+    Returns None when the row has no usable fundamentals.
+    """
+    if edgar_row is None:
+        return None
+    earned = possible = 0
+
+    def band(v, strong, ok):
+        nonlocal earned, possible
+        if v is None or pd.isna(v):
+            return
+        possible += 2
+        earned += 2 if v >= strong else (1 if v >= ok else 0)
+
+    band(edgar_row.get("edgar_revenue_yoy"),   0.15, 0.0)
+    band(edgar_row.get("edgar_ni_yoy"),        0.15, 0.0)
+    band(edgar_row.get("edgar_op_margin"),     0.15, 0.0)
+    band(edgar_row.get("edgar_net_margin"),    0.10, 0.0)
+    band(edgar_row.get("edgar_revenue_accel"), 0.0, -0.10)
+    if possible == 0:
+        return None
+    return round(earned / possible * 100, 1)
+
+
 def replay_ticker(symbol: str) -> list[dict]:
-    """Score the technical lens weekly across *symbol*'s history."""
+    """Score the technical lens (and, when available, a point-in-time
+    EDGAR fundamental score) weekly across *symbol*'s history."""
     price_df = _prepare_price_df(symbol)
     if price_df is None:
         return []
@@ -140,6 +169,15 @@ def replay_ticker(symbol: str) -> list[dict]:
     # for info["fiftyTwoWeekHigh"/"Low"].
     hi_52 = close.rolling(252, min_periods=60).max()
     lo_52 = close.rolling(252, min_periods=60).min()
+
+    # Point-in-time fundamentals (joined on SEC filing date — leak-free).
+    # None for foreign/ADR tickers, in which case fund_score stays absent.
+    edgar_feats = None
+    try:
+        from data import edgar_data
+        edgar_feats = edgar_data.get_fundamental_features(symbol, ind.index)
+    except Exception:
+        edgar_feats = None
 
     lens_cols = ("Close", "RSI", "SMA_20", "SMA_50", "SMA_200",
                  "ADX", "ADX_PDI", "ADX_NDI", "BB_PctB")
@@ -168,6 +206,10 @@ def replay_ticker(symbol: str) -> list[dict]:
             "score":    res["score"],
             "possible": res["possible"],
         }
+        if edgar_feats is not None:
+            fscore = _fundamental_score_asof(edgar_feats.iloc[i].to_dict())
+            if fscore is not None:
+                row["fund_score"] = fscore
         base = float(close.iloc[i])
         for h in HORIZONS:
             row[f"fwd_{h}d"] = (
@@ -307,13 +349,42 @@ def run_backtest(console, tickers: list[str], broad: bool = False) -> None:
                 console.print(f"    · {tag} (n={len(part)}): IC {ic_t:+.3f}")
         console.print()
 
+    # ── Fundamental score (EDGAR point-in-time) — now backtestable ─ #
+    if "fund_score" in df.columns and df["fund_score"].notna().sum() >= 100:
+        console.print("[bold cyan]Fundamental lens (SEC EDGAR point-in-time)[/bold cyan]")
+        fbuckets = [(-1, 34, "<34  (weak)"), (34, 67, "34–66 (mixed)"), (67, 999, "≥67  (strong)")]
+        for h in HORIZONS:
+            fwd = f"fwd_{h}d"
+            sub = df.dropna(subset=[fwd, "fund_score"])
+            if len(sub) < 100:
+                continue
+            table = Table(title=f"{h}-day forward returns by fundamental score "
+                                f"({len(sub)} obs, {sub['ticker'].nunique()} tickers)")
+            table.add_column("Fund bucket")
+            table.add_column("N", justify="right")
+            table.add_column("Mean fwd", justify="right")
+            table.add_column("Hit rate", justify="right")
+            for lo, hi, name in fbuckets:
+                chunk = sub[(sub["fund_score"] >= lo) & (sub["fund_score"] < hi)]
+                if chunk.empty:
+                    continue
+                table.add_row(name, str(len(chunk)),
+                              f"{chunk[fwd].mean() * 100:+.2f}%",
+                              f"{(chunk[fwd] > 0).mean() * 100:.0f}%")
+            console.print(table)
+            ic, ic_p = spearmanr(sub["fund_score"], sub[fwd])
+            console.print(f"  Spearman IC (fundamental score → {h}d return): "
+                          f"[bold]{ic:+.3f}[/bold] (p={ic_p:.1e})\n")
+
     if skipped:
         console.print(f"[dim]Skipped (insufficient history): {', '.join(skipped)}[/dim]")
     console.print(f"Full observation CSV: [green]{csv_path}[/green]")
     console.print(
-        "\n[dim]Read with care: (1) technical lens only — fundamental/valuation lenses "
-        "cannot be replayed without point-in-time data; (2) today's universe = "
-        "survivorship bias (delisted losers are invisible); (3) weekly samples with "
+        "\n[dim]Read with care: (1) the technical lens uses only price-derived "
+        "signals and the fundamental lens uses SEC EDGAR point-in-time filings "
+        "(both leak-free); the live valuation lens still can't be replayed "
+        "(current-snapshot multiples); (2) today's universe = survivorship bias "
+        "(delisted losers are invisible); (3) weekly samples with "
         f"{HORIZONS[-1]}-day windows overlap, so effective sample size is smaller "
         "than N suggests.[/dim]\n"
     )

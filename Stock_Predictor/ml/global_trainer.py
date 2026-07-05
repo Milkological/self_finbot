@@ -57,14 +57,26 @@ _load_attempted = False
 # ------------------------------------------------------------------ #
 
 def _latest_features_csvs(reports_dir: str = REPORTS_DIR) -> dict[str, str]:
-    """Map each ticker to its most recent reports/{T}_{DATE}/features.csv."""
+    """
+    Map each ticker to its most recent features.csv, pooling two sources:
+      • per-run reports/{T}_{DATE}/features.csv (your analyzed tickers)
+      • reports/_universe/{T}/features.csv (the broad training universe
+        built by `python main.py --build-universe`)
+    The universe copies only fill in tickers not already covered by a
+    (fresher, sentiment-bearing) per-run report.
+    """
     out: dict[str, str] = {}
+    # Per-run reports first (dated dirs) — later dates win via sorted().
     for path in sorted(glob.glob(os.path.join(reports_dir, "*", "features.csv"))):
         dirname = os.path.basename(os.path.dirname(path))
         m = re.match(r"(.+)_(\d{4}-\d{2}-\d{2})$", dirname)
         if not m:
             continue
-        out[m.group(1).upper()] = path   # sorted() ⇒ later dates win
+        out[m.group(1).upper()] = path
+    # Universe copies — only add tickers not already present.
+    for path in sorted(glob.glob(os.path.join(reports_dir, "_universe", "*", "features.csv"))):
+        tkr = os.path.basename(os.path.dirname(path)).upper()
+        out.setdefault(tkr, path)
     return out
 
 

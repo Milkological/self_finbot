@@ -61,11 +61,13 @@ returns a placeholder result so the rest of the program continues.
 """
 
 import json
+import logging
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from json_repair import repair_json
-from openai import AzureOpenAI, OpenAI
+from openai import AzureOpenAI, OpenAI, APIConnectionError, APITimeoutError
 from google import genai
 from google.genai import types as genai_types
 
@@ -87,7 +89,71 @@ from config import (
     LLM_MAX_TOKENS_AZURE,
     LLM_MAX_TOKENS_GOOGLE,
     LLM_MAX_TOKENS_DEEPSEEK,
+    LLM_TIMEOUT,
+    LLM_MAX_RETRIES,
+    LLM_CIRCUIT_THRESHOLD,
 )
+
+logger = logging.getLogger(__name__)
+
+
+# ================================================================== #
+# Per-provider circuit breaker
+# ================================================================== #
+
+def _is_connection_error(exc: Exception) -> bool:
+    """
+    True when *exc* looks like the provider is unreachable/hanging (as
+    opposed to a per-agent content error like a JSON parse failure, which
+    should NOT trip the breaker). Covers the openai SDK's connection and
+    timeout classes plus common connection signatures from any provider.
+    """
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    markers = ("connection error", "connection aborted", "connection refused",
+               "connection reset", "timed out", "timeout", "getaddrinfo",
+               "max retries", "name or service not known", "temporary failure",
+               "failed to establish", "unavailable", "deadline exceeded")
+    return any(m in text for m in markers)
+
+
+class _CircuitBreaker:
+    """
+    Trips after LLM_CIRCUIT_THRESHOLD consecutive connection-class failures
+    for one provider, after which the provider's remaining agents in the
+    13-agent chain are skipped immediately instead of each re-hitting the
+    dead endpoint (and paying the full timeout). Thread-safe: wave 1 runs
+    four agents in parallel against the same breaker.
+    """
+
+    def __init__(self, provider: str, threshold: int = 2):
+        self.provider  = provider
+        self.threshold = max(1, threshold)
+        self._failures = 0
+        self.tripped   = False
+        self.reason    = ""
+        self.tripped_at = ""        # human label of the agent/wave that tripped it
+        self._lock     = threading.Lock()
+
+    def is_open(self) -> bool:
+        return self.tripped
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+
+    def record_failure(self, exc: Exception, where: str = "") -> None:
+        with self._lock:
+            if not _is_connection_error(exc):
+                return          # content error — transient, don't trip
+            self._failures += 1
+            if self._failures >= self.threshold and not self.tripped:
+                self.tripped    = True
+                self.reason     = str(exc)
+                self.tripped_at = where
+                logger.warning("LLM provider %s circuit OPEN after %s: %s",
+                               self.provider, where or "repeated failures", exc)
 
 # ReAct system instruction injected into every agent call
 _REACT_SYSTEM = (
@@ -1350,6 +1416,7 @@ def _error_result(msg: str) -> dict:
 def _run_agent_chain(
     call_fn, ticker, info, technical, fundamental, statistical, analyst_data,
     ml_result=None, accuracy_context=None,
+    provider_name="", breaker=None, progress_cb=None,
 ) -> dict:
     """
     Run the full 13-agent chain using a single provider's call function.
@@ -1362,19 +1429,42 @@ def _run_agent_chain(
     STEP 4 [parallel]:   T1 Momentum, T2 Value, T3 Swing, RM1 Market Risk
     STEP 5 [serial]:     RM2 Portfolio Risk        (depends on T1+T2+T3+RM1)
     STEP 6 [serial]:     Judge                     (depends on everything)
+
+    ``breaker`` is a _CircuitBreaker: once it trips (provider unreachable),
+    later agents short-circuit to their rule-based fallbacks instead of
+    each re-hitting the dead endpoint. ``progress_cb(provider, stage)`` is
+    invoked at the start of each wave for live UI.
     """
     sentiment = (ml_result.get("sentiment", {}) if ml_result and isinstance(ml_result, dict)
                  else {"overall_score": 0.0, "label": "NEUTRAL", "summary": ""})
 
-    def _safe_call(prompt_fn, fallback_fn, *args, **kwargs):
+    def _note(stage: str) -> None:
+        if progress_cb:
+            try:
+                progress_cb(provider_name, stage)
+            except Exception:
+                pass
+
+    def _safe_call(prompt_fn, fallback_fn, *args, _agent="agent", **kwargs):
+        # Skip immediately once the provider's breaker is open.
+        if breaker is not None and breaker.is_open():
+            fb = fallback_fn()
+            fb["_error"] = f"skipped — {provider_name} unreachable (circuit open)"
+            return fb
         try:
-            return call_fn(prompt_fn(*args, **kwargs))
+            r = call_fn(prompt_fn(*args, **kwargs))
+            if breaker is not None:
+                breaker.record_success()
+            return r
         except Exception as e:
+            if breaker is not None:
+                breaker.record_failure(e, where=_agent)
             fb = fallback_fn()
             fb["_error"] = str(e)
             return fb
 
     # -- STEP 1: Analyst Team (4 parallel) -------------------------
+    _note("Analyst team (1/6)")
     with ThreadPoolExecutor(max_workers=4) as ex:
         f_fund = ex.submit(_safe_call,
             _build_fundamental_analyst_prompt, _fallback_fundamental_analyst,
@@ -1394,6 +1484,7 @@ def _run_agent_chain(
     technical_analyst   = f_tech.result()
 
     # -- STEP 2: Researcher Team -- Bull + Bear (parallel) ----------
+    _note("Researchers (2/6)")
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_bull = ex.submit(_safe_call,
             _build_bullish_researcher_prompt, _fallback_bullish_researcher,
@@ -1407,12 +1498,14 @@ def _run_agent_chain(
     bearish_researcher = f_bear.result()
 
     # -- STEP 3: Researcher Team -- Synthesizer (serial) -----------
+    _note("Synthesizer (3/6)")
     synthesizer = _safe_call(
         _build_research_synthesizer_prompt, _fallback_synthesizer,
         ticker, info, bullish_researcher, bearish_researcher,
     )
 
     # -- STEP 4: Trading Team + Market Risk (4 parallel) -----------
+    _note("Traders + market risk (4/6)")
     with ThreadPoolExecutor(max_workers=4) as ex:
         f_mom = ex.submit(_safe_call,
             _build_momentum_trader_prompt, _fallback_momentum_trader,
@@ -1437,6 +1530,7 @@ def _run_agent_chain(
     market_risk     = f_mr.result()
 
     # -- STEP 5: Portfolio Risk (serial) ---------------------------
+    _note("Portfolio risk (5/6)")
     portfolio_risk = _safe_call(
         _build_portfolio_risk_prompt, _fallback_portfolio_risk,
         ticker, info, statistical, analyst_data,
@@ -1444,17 +1538,26 @@ def _run_agent_chain(
     )
 
     # -- STEP 6: The Judge (serial) --------------------------------
-    try:
-        judge = call_fn(_build_judge_prompt(
-            ticker, info, technical, fundamental, statistical, analyst_data,
-            fundamental_analyst, sentiment_analyst, news_analyst, technical_analyst,
-            bullish_researcher, bearish_researcher, synthesizer,
-            momentum_trader, value_trader, swing_trader,
-            market_risk, portfolio_risk, ml_result,
-            accuracy_context=accuracy_context,
-        ))
-    except Exception as e:
-        judge = _error_result(f"Judge error: {e}")
+    _note("Judge (6/6)")
+    if breaker is not None and breaker.is_open():
+        judge = _error_result(
+            f"Judge skipped — {provider_name} unreachable (circuit open after "
+            f"{breaker.tripped_at or 'repeated failures'})."
+        )
+    else:
+        try:
+            judge = call_fn(_build_judge_prompt(
+                ticker, info, technical, fundamental, statistical, analyst_data,
+                fundamental_analyst, sentiment_analyst, news_analyst, technical_analyst,
+                bullish_researcher, bearish_researcher, synthesizer,
+                momentum_trader, value_trader, swing_trader,
+                market_risk, portfolio_risk, ml_result,
+                accuracy_context=accuracy_context,
+            ))
+        except Exception as e:
+            if breaker is not None:
+                breaker.record_failure(e, where="judge")
+            judge = _error_result(f"Judge error: {e}")
 
     judge["agents"] = {
         "fundamental_analyst": fundamental_analyst,
@@ -1554,6 +1657,8 @@ def _get_azure_client() -> AzureOpenAI:
         api_key        = AZURE_OPENAI_KEY,
         azure_endpoint = AZURE_OPENAI_ENDPOINT,
         api_version    = AZURE_OPENAI_API_VERSION,
+        timeout        = LLM_TIMEOUT,
+        max_retries    = LLM_MAX_RETRIES,
     )
 
 
@@ -1587,8 +1692,19 @@ def _call_azure(prompt: str) -> dict:
 
 @lru_cache(maxsize=1)
 def _get_google_client() -> "genai.Client":
-    """Build the Gemini client once and reuse it across all agent calls."""
-    return genai.Client(api_key=GOOGLE_API_KEY)
+    """Build the Gemini client once and reuse it across all agent calls.
+
+    The google-genai SDK takes its request timeout (in MILLISECONDS) via
+    HttpOptions. Wrapped in try/except so an SDK version without that field
+    degrades to the default rather than crashing the whole LLM path.
+    """
+    try:
+        return genai.Client(
+            api_key      = GOOGLE_API_KEY,
+            http_options = genai_types.HttpOptions(timeout=int(LLM_TIMEOUT * 1000)),
+        )
+    except Exception:
+        return genai.Client(api_key=GOOGLE_API_KEY)
 
 
 def _call_google(prompt: str) -> dict:
@@ -1626,8 +1742,10 @@ def _call_google(prompt: str) -> dict:
 def _get_deepseek_client() -> OpenAI:
     """Build the DeepSeek (OpenAI-compatible) client once and reuse it."""
     return OpenAI(
-        api_key  = DEEPSEEK_API_KEY,
-        base_url = DEEPSEEK_BASE_URL,
+        api_key     = DEEPSEEK_API_KEY,
+        base_url    = DEEPSEEK_BASE_URL,
+        timeout     = LLM_TIMEOUT,
+        max_retries = LLM_MAX_RETRIES,
     )
 
 
@@ -1690,6 +1808,7 @@ def get_llm_analysis(
     ml_result:    dict = None,
     accuracy_context: dict = None,
     accuracy_context_map: dict = None,
+    progress_cb=None,
 ) -> dict:
     """
     Run the full 5-team, 13-agent LLM analysis pipeline for *ticker*.
@@ -1753,19 +1872,37 @@ def get_llm_analysis(
     if DEEPSEEK_ENABLED:
         provider_specs.append((f"DeepSeek ({DEEPSEEK_MODEL})", _call_deepseek))
 
+    breakers = {pname: _CircuitBreaker(pname, LLM_CIRCUIT_THRESHOLD)
+                for pname, _ in provider_specs}
+
     def _run_provider(pname: str, call_fn) -> dict:
         """Run one provider's full 13-agent chain. Never raises."""
+        breaker = breakers[pname]
         try:
             chain = _run_agent_chain(
                 call_fn, ticker, info, technical, fundamental,
                 statistical, analyst_data, ml_result,
                 accuracy_context=_ctx(pname),
+                provider_name=pname, breaker=breaker, progress_cb=progress_cb,
             )
+            # A tripped breaker means the endpoint was unreachable: the
+            # "chain" is all rule-based fallbacks, so mark it unavailable
+            # rather than presenting fabricated LLM output.
+            if breaker.is_open():
+                res = _error_result(
+                    f"{pname} unreachable — {breaker.reason} "
+                    f"(circuit opened at {breaker.tripped_at or 'startup'})."
+                )
+                res["_provider"] = pname
+                return res
             chain["llm_available"] = True
             chain["_provider"]     = pname
             return chain
         except Exception as e:
-            return _error_result(f"{pname} error: {e}")
+            logger.warning("LLM provider %s failed: %s", pname, e)
+            res = _error_result(f"{pname} error: {e}")
+            res["_provider"] = pname
+            return res
 
     # Run every provider chain concurrently — they are fully independent,
     # so wall-clock collapses to the slowest single provider rather than
@@ -1790,17 +1927,46 @@ def get_llm_analysis(
             primary_result = result
             break
 
-    if primary_result is None:
-        err_msg = " | ".join(
-            r.get("summary", "Unknown error")
-            for r in providers_result.values()
-            if not r.get("llm_available", False)
-        )
-        return _error_result(f"All LLM providers failed: {err_msg}")
+    # Per-provider failure summary — surfaced to the caller (main.py prints it)
+    provider_errors = {
+        pname: providers_result[pname].get("summary", "Unknown error")
+        for pname, _ in provider_specs
+        if not providers_result.get(pname, {}).get("llm_available", False)
+    }
 
-    primary_result["llm_available"] = True
-    primary_result["providers"]     = providers_result
-    primary_result["description"]   = description
+    if primary_result is None:
+        # Every provider failed. Rather than returning a HOLD/N/A stub, hand
+        # off to the deterministic rule-based judge so the user still gets a
+        # real, actionable analysis. Lazy import avoids a circular dependency
+        # (rule_based_judge imports build_company_description from this module).
+        err_msg = " | ".join(f"{p}: {m}" for p, m in provider_errors.items()) or "unknown"
+        logger.warning("All LLM providers failed (%s) — falling back to rule-based judge.", err_msg)
+        try:
+            from analysis.rule_based_judge import run_rule_based_analysis
+            fallback = run_rule_based_analysis(
+                info, technical, fundamental, statistical, analyst_data, ml_result,
+                accuracy_context=accuracy_context,
+            )
+            fallback["llm_available"]   = False
+            fallback["llm_failed"]      = True
+            fallback["provider_errors"] = provider_errors
+            fallback["providers"]       = providers_result
+            fallback["description"]     = description
+            fallback["summary"] = (
+                "All LLM providers were unreachable — showing the deterministic "
+                "rule-based judge instead. (" + err_msg + ")"
+            )
+            return fallback
+        except Exception as e:
+            logger.error("Rule-based fallback also failed: %s", e)
+            res = _error_result(f"All LLM providers failed: {err_msg}")
+            res["provider_errors"] = provider_errors
+            return res
+
+    primary_result["llm_available"]   = True
+    primary_result["providers"]       = providers_result
+    primary_result["provider_errors"] = provider_errors
+    primary_result["description"]     = description
 
     # Apply per-provider bias correction to each provider's target prices
     try:
@@ -1817,3 +1983,67 @@ def get_llm_analysis(
         pass
 
     return primary_result
+
+
+# ================================================================== #
+# Provider health check (used by the --doctor diagnostic)
+# ================================================================== #
+
+def ping_providers() -> list[dict]:
+    """
+    Send a minimal 1-token request to every configured provider to check
+    reachability, WITHOUT running the 13-agent chain. Reuses the same
+    cached clients (so it exercises the real timeout/endpoint config) and
+    the circuit breaker's error classifier for a clean reason.
+
+    Returns one dict per configured provider:
+        {"provider": str, "ok": bool, "latency_s": float|None,
+         "connection_error": bool, "detail": str}
+    An empty list means no provider is configured at all.
+    """
+    import time
+
+    specs = []
+    if AZURE_ENABLED:
+        specs.append(("Azure OpenAI", _get_azure_client, AZURE_OPENAI_DEPLOYMENT, "openai"))
+    if GOOGLE_ENABLED:
+        specs.append((f"Google Gemini ({GOOGLE_MODEL})", _get_google_client, GOOGLE_MODEL, "google"))
+    if DEEPSEEK_ENABLED:
+        specs.append((f"DeepSeek ({DEEPSEEK_MODEL})", _get_deepseek_client, DEEPSEEK_MODEL, "openai"))
+
+    # A diagnostic should fail fast — override to a short timeout so
+    # `--doctor` doesn't wait out the full LLM_TIMEOUT per dead provider.
+    ping_timeout = min(LLM_TIMEOUT, 15.0)
+
+    results = []
+    for pname, client_fn, model, kind in specs:
+        t0 = time.time()
+        try:
+            client = client_fn()
+            if kind == "openai":
+                # .with_options returns a shallow client copy with a shorter
+                # per-request timeout and no retries.
+                client.with_options(timeout=ping_timeout, max_retries=0).chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                    temperature=0.0,
+                )
+            else:  # google
+                client.models.generate_content(
+                    model=model,
+                    contents="ping",
+                    config=genai_types.GenerateContentConfig(max_output_tokens=1),
+                )
+            results.append({
+                "provider": pname, "ok": True,
+                "latency_s": round(time.time() - t0, 2),
+                "connection_error": False, "detail": "reachable",
+            })
+        except Exception as e:
+            results.append({
+                "provider": pname, "ok": False, "latency_s": None,
+                "connection_error": _is_connection_error(e),
+                "detail": f"{type(e).__name__}: {str(e)[:160]}",
+            })
+    return results

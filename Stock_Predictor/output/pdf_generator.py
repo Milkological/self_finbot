@@ -18,7 +18,18 @@ Output: reports/{TICKER}_{DATE}/report.pdf
 """
 
 import os
+import io
 import datetime
+
+# ---------------------------------------------------------------------------
+# Force FlateDecode (zlib) for embedded images instead of ASCII85.
+# reportlab 4.5 ships useA85=1, but its C accelerator is not compiled in this
+# environment, so image streams go through the pure-Python _py_asciiBase85Encode,
+# which crashes on Python 3.14 / Pillow 12 ("cannot unpack non-iterable int
+# object"). FlateDecode bypasses that path entirely and yields smaller PDFs.
+# Must be set before any doc is built.
+import reportlab.rl_config as _rl_config
+_rl_config.useA85 = 0
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
@@ -258,6 +269,32 @@ def _generic_table(headers: list, rows: list, col_widths: list) -> Table:
     return tbl
 
 
+def _flatten_to_rgb(path: str):
+    """
+    Return a file-like object holding *path* re-encoded as a plain 8-bit RGB
+    PNG (alpha flattened onto white). matplotlib writes RGBA PNGs, and an
+    alpha channel is a second trigger for reportlab's image-encoding bugs;
+    a flat RGB image sidesteps it. Falls back to the original path on any
+    error so a chart is never lost to this hardening step.
+    """
+    try:
+        from PIL import Image as PILImage
+        im = PILImage.open(path)
+        if im.mode in ("RGBA", "LA", "P"):
+            im = im.convert("RGBA")
+            bg = PILImage.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        else:
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        buf.seek(0)
+        return buf
+    except Exception:
+        return path
+
+
 def _embed_chart(path: str, label: str) -> list:
     """
     Return a list of flowables embedding a chart PNG, or a placeholder
@@ -272,7 +309,7 @@ def _embed_chart(path: str, label: str) -> list:
         img_h = img_w * ratio
         return [
             _p(f"<b>{label}</b>", "h3"),
-            Image(path, width=img_w, height=img_h, kind="proportional"),
+            Image(_flatten_to_rgb(path), width=img_w, height=img_h, kind="proportional"),
             _sp(0.3),
         ]
     return [_p(f"[Chart not available: {label}]", "small")]

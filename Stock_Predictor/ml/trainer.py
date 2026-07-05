@@ -94,6 +94,12 @@ FEATURE_COLS = [
     "drawdown_from_peak",
     # Volume anomaly
     "volume_zscore_20d",
+    # SEC EDGAR point-in-time fundamentals (leak-free, joined on filing date;
+    # NaN → dropped per-ticker for foreign/ADR names with no US-GAAP facts)
+    "edgar_revenue_yoy", "edgar_ni_yoy", "edgar_revenue_accel",
+    "edgar_op_margin", "edgar_net_margin",
+    # Earnings-surprise momentum (NaN when the earnings calendar is unavailable)
+    "earnings_surprise_last", "earnings_surprise_avg4",
 ]
 
 # GradientBoosting hyper-parameters (conservative — limited data)

@@ -5,3 +5,8 @@ ARIS   # discovered 2026-07-04 via day_gainers, score 68.5
 FIS    # discovered 2026-07-04 via undervalued_growth_stocks+growth_technology_stocks, score 68.2
 MU     # discovered 2026-07-04 via most_actives+growth_technology_stocks, score 65.3
 AUGO   # discovered 2026-07-04 via day_gainers, score 62.5
+AAPL   # discovered 2026-07-05 via most_actives, score 68.5
+NVDA   # discovered 2026-07-05 via most_actives+growth_technology_stocks, score 62.2
+T      # discovered 2026-07-05 via most_actives+undervalued_growth_stocks, score 62.1
+SOFI   # discovered 2026-07-05 via most_actives, score 54.4
+AAL    # discovered 2026-07-05 via most_actives, score 53.9

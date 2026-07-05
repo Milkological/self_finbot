@@ -252,6 +252,60 @@ def _build_feature_df(
         / rolling_std_20.replace(0, np.nan)
     )
 
+    # ── 7b. SEC EDGAR point-in-time fundamentals ─────────────────── #
+    # Leak-free quarterly fundamentals joined on each figure's SEC FILING
+    # date (not its period end), so a trading day only ever sees numbers
+    # already public by then. Left as NaN when unavailable (foreign/ADR or
+    # no lxml-free JSON facts) — the trainer drops all-NaN columns per
+    # ticker, so this never becomes a degenerate constant.
+    try:
+        from data import edgar_data
+        edgar_feats = edgar_data.get_fundamental_features(ticker, feat.index)
+        if edgar_feats is not None:
+            for col in edgar_data.FEATURE_NAMES:
+                feat[col] = edgar_feats[col].values if col in edgar_feats.columns else np.nan
+        else:
+            for col in edgar_data.FEATURE_NAMES:
+                feat[col] = np.nan
+    except Exception:
+        from data import edgar_data
+        for col in edgar_data.FEATURE_NAMES:
+            feat[col] = np.nan
+
+    # ── 7c. Earnings-surprise features (point-in-time) ───────────── #
+    # yfinance's earnings calendar carries a "Surprise(%)" column (actual
+    # vs estimate). A surprise is only known from the earnings date onward,
+    # so we forward-fill from each earnings date — never before it. Depends
+    # on lxml (yfinance scrapes HTML); degrades to NaN when unavailable.
+    feat["earnings_surprise_last"] = np.nan
+    feat["earnings_surprise_avg4"] = np.nan
+    try:
+        cal = market_data.get_earnings_dates(ticker)
+        if cal is not None and not cal.empty:
+            surprise_col = next((c for c in cal.columns if "surprise" in str(c).lower()), None)
+            if surprise_col is not None:
+                sdf = cal[[surprise_col]].copy()
+                sdf.index = pd.to_datetime(sdf.index).tz_localize(None) \
+                    if getattr(sdf.index, "tz", None) is not None else pd.to_datetime(sdf.index)
+                sdf = sdf[pd.to_numeric(sdf[surprise_col], errors="coerce").notna()]
+                sdf["val"] = pd.to_numeric(sdf[surprise_col], errors="coerce")
+                sdf = sdf.sort_index()
+                sdf["avg4"] = sdf["val"].rolling(4, min_periods=1).mean()
+                fidx = pd.to_datetime(feat.index).tz_localize(None) \
+                    if getattr(feat.index, "tz", None) is not None else pd.to_datetime(feat.index)
+                # As-of backward join: only surprises already announced.
+                left = pd.DataFrame({"date": fidx}).reset_index(names="pos").sort_values("date")
+                right = sdf.reset_index().rename(columns={sdf.index.name or "index": "date"})
+                right["date"] = pd.to_datetime(right["date"]).astype("datetime64[ns]")
+                left["date"]  = left["date"].astype("datetime64[ns]")
+                right = right.sort_values("date")
+                m = pd.merge_asof(left, right[["date", "val", "avg4"]],
+                                  on="date", direction="backward").sort_values("pos")
+                feat["earnings_surprise_last"] = m["val"].values
+                feat["earnings_surprise_avg4"] = m["avg4"].values
+    except Exception:
+        pass
+
     # ── 8. Forward-return labels (supervised targets) ───────────── #
     # direction: 1 = price up, 0 = price down or flat
     # return:    raw percentage change

@@ -5,6 +5,138 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) co
 
 ---
 
+## [1.7.0] — 2026-07-06
+
+**Go LLM-free.** Makes the deterministic judge + ML the primary product so the tool
+works fully with zero API keys. (The LLM pipeline stays in place, dormant without keys,
+for optional use and A/B comparison.)
+
+### Added
+
+#### Offline headline sentiment (`data/sentiment_fetcher.py`)
+- `score_headlines()` now falls back to **VADER** (offline lexicon) when no LLM is
+  configured — previously headline sentiment was a permanent 0.0 stub in `--no-llm` mode.
+  Augmented with a **finance-domain lexicon** (beats/miss/downgrade/plunge/surge/…) so it
+  reads financial headlines correctly (bullish set +0.88, was neutral before the lexicon).
+  Real sentiment now accumulates daily in `feedback/sentiment_history_*.csv`. Adds
+  `vaderSentiment` to requirements.
+
+#### `--no-llm` reports are no longer half-empty (`analysis/rule_based_judge.py`)
+- `sentiment_verdict`, `macro_verdict`, and `catalysts` were hardcoded "N/A" stubs; they
+  are now derived from data already in hand — VADER sentiment, VIX/vol regime + earnings
+  proximity, and rule-based catalysts (next earnings, recent upgrades, analyst upside,
+  52-week-high proximity, positive news flow).
+
+#### Cap-aware technical weighting (`analysis/rule_based_judge.py`)
+- The backtester found the technical lens predicts on volatile/small names (IC +0.067) but
+  **inverts on large caps** (IC −0.039). Above ~$10B market cap the technical lens weight is
+  now halved and redistributed to the (cap-agnostic) fundamental & valuation lenses. Surfaced
+  as `effective_weights.cap_adjusted`.
+
+#### Training universe (`ml/universe_builder.py`, `--build-universe`)
+- One-off resumable batch that builds feature CSVs for ~10 liquid large caps per sector
+  (~110 tickers) under `reports/_universe/`, then retrains the pooled global model — taking
+  its training pool from ~8 tickers/~7k rows to ~100 tickers/~120k rows (the biggest ML data
+  lever). `global_trainer._latest_features_csvs` now pools per-run reports + the universe.
+
+#### Paper-trading scoreboard (`portfolio/simulator.py`, `--portfolio`)
+- Replays resolved BUY/STRONG BUY predictions as equal-weight paper trades (entry at call
+  price, exit at the resolved actual) and reports win rate, average/conviction-weighted
+  return, and excess vs holding SPY over matched windows. The single honest number for "is
+  the LLM-free path actually good?" Uses only data the feedback loop already produces;
+  `--horizon` and `--provider rule_based` supported.
+
+### Deferred (designed, not built — see ROADMAP)
+Composite-threshold validation and VIX-regime-conditional technical scoring both need the
+backtester extended to replay the *full composite* (it currently replays single lenses);
+CV-fold isotonic calibration, quantile target bands, and a pooled hyperparameter search are
+follow-ups best run after the universe build provides the data volume to tune against.
+
+---
+
+## [1.6.0] — 2026-07-06
+
+Roadmap session 1: a diagnostic command and CI/dependency infrastructure.
+
+### Added
+
+#### `--doctor` environment & connectivity health check (`diagnostics.py`)
+- One command that answers "why is nothing happening?": probes each configured LLM
+  provider with a real fast (≤15s) 1-token ping, Yahoo Finance and SEC EDGAR
+  reachability, `lxml` availability (earnings-surprise features), per-ticker ML model
+  freshness + the global pooled model, and feedback-CSV schema integrity — printed as a
+  pass/warn/fail table. Exits non-zero on any FAIL so it doubles as a pre-flight check.
+- On first run it immediately surfaced two real issues: Azure unreachable while
+  Google/DeepSeek work (so the pipeline *does* run, just slowly on the reasoner models),
+  and 5 legacy feedback CSVs missing the `provider` column (pre-multi-provider drift).
+- Backed by a new `ping_providers()` in `analysis/llm_analysis.py` that reuses the
+  cached clients and the circuit breaker's connection-error classifier.
+
+#### CI & dependency infrastructure
+- `.github/workflows/ci.yml` — runs the (offline, mocked) test suite on Python 3.12/3.13
+  for every push/PR touching `Stock_Predictor/`, plus an informational `--doctor` smoke step.
+- `requirements.lock` — exact known-good pinned versions (the reportlab/Python-3.14/Pillow-12
+  break was a drift bug; this prevents repeats). `requirements.txt` stays ranged for upgrades.
+- `.env.example` refreshed with the 1.5.0 resilience keys (`LLM_TIMEOUT`,
+  `LLM_MAX_RETRIES`, `LLM_CIRCUIT_THRESHOLD`).
+
+---
+
+## [1.5.0] — 2026-07-05
+
+Hardens the LLM pipeline so a dead provider can no longer freeze a run, fixes a
+PDF-generation crash, and adds **point-in-time fundamentals from SEC EDGAR** —
+the first leak-free fundamental data in the project.
+
+### Fixed
+
+#### PDF generation crashed on chart images (`output/pdf_generator.py`)
+- **What:** `doc.build()` raised `TypeError: cannot unpack non-iterable int object`
+  from reportlab's `_py_asciiBase85Encode`. reportlab 4.5 defaults to ASCII85 image
+  encoding (`useA85=1`) but its C accelerator isn't compiled here, so it used the
+  pure-Python base85 encoder, which is broken on Python 3.14 / Pillow 12.
+- **Fix:** force `rl_config.useA85 = 0` (FlateDecode) — bypasses the broken path and
+  yields smaller PDFs — plus flatten chart PNGs to RGB (removes the alpha channel,
+  a second trigger) before embedding. Verified against real report charts.
+
+#### LLM runs could appear frozen for minutes (`analysis/llm_analysis.py`)
+- **What:** provider clients were built with no timeout/retry override, inheriting the
+  SDK defaults (600s timeout, 2 retries). A hanging or unreachable provider made every
+  one of the 13 agents block in turn, and all errors were swallowed silently — the run
+  looked frozen with no explanation.
+- **Fix (several parts):**
+  - Configurable `LLM_TIMEOUT` (60s) and `LLM_MAX_RETRIES` (1) on all three clients.
+  - A per-provider **circuit breaker**: after `LLM_CIRCUIT_THRESHOLD` (2) consecutive
+    connection-class failures, that provider's remaining agents skip instantly instead
+    of each re-hitting the dead endpoint. A dead provider now costs seconds, not minutes.
+  - **Visible errors:** each provider failure is logged and printed (`LLM provider
+    unavailable — <name>: <reason>`), no longer silent.
+  - **First-class fallback:** when ALL providers fail, `get_llm_analysis` now returns the
+    full deterministic rule-based analysis instead of a HOLD/N/A stub.
+  - **Live progress:** a callback drives the terminal spinner through each provider/wave
+    (`LLM · DeepSeek · Traders + market risk (4/6)`) so a long step always shows motion.
+
+### Added
+
+#### SEC EDGAR point-in-time fundamentals (`data/edgar_data.py`)
+- Free, key-less XBRL company-facts API. Quarterly revenue, net income, operating income
+  extracted across multiple candidate tags (filers switch tags over time), each figure
+  joined onto price rows by its **filing date** — so a trading day only ever sees numbers
+  already public. The first genuinely leak-free fundamental data in the project; cached
+  7 days under `.cache/edgar/`. Foreign/ADR tickers (not in EDGAR) degrade to NaN.
+- **New leak-free ML features** (`data/csv_exporter.py`, added to `FEATURE_COLS` →
+  auto-retrain): `edgar_revenue_yoy`, `edgar_ni_yoy` (net-income YoY — split-immune,
+  unlike EPS), `edgar_revenue_accel`, `edgar_op_margin`, `edgar_net_margin`, plus
+  `earnings_surprise_last` / `earnings_surprise_avg4` from the earnings calendar.
+- **Fundamental lens is now backtestable** (`analysis/backtester.py`): `--backtest`
+  computes a point-in-time EDGAR fundamental score alongside the technical lens and
+  reports its forward-return buckets and rank IC — the fundamental lens could never be
+  honestly backtested before (yfinance only exposes current snapshots).
+- `lxml` and `pillow` added to `requirements.txt` (earnings-calendar scraping and PDF
+  image flattening, respectively).
+
+---
+
 ## [1.4.0] — 2026-07-04
 
 This release **fixes real scoring bugs in the rule-based judge**, makes ML validation

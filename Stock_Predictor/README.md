@@ -377,9 +377,37 @@ LLM_TEMPERATURE=0.0          # default 0.0 (deterministic); raise toward 0.3 for
 LLM_MAX_TOKENS_AZURE=8000
 LLM_MAX_TOKENS_GOOGLE=8192
 LLM_MAX_TOKENS_DEEPSEEK=8000
+
+# ── LLM resilience (safe to leave as-is) ────────────────────────────
+LLM_TIMEOUT=60               # per-request timeout in seconds (was an SDK default of 600)
+LLM_MAX_RETRIES=0            # per-request retries (0 = fail fast; the circuit breaker handles resilience)
+LLM_CIRCUIT_THRESHOLD=2      # consecutive connection failures before a provider is skipped
 ```
 
 If multiple providers are configured, **all run concurrently** (in parallel threads) and their outputs are combined — total wall-clock is roughly the slowest single provider, not the sum. Each active provider appears in the terminal display and Markdown report. Any provider whose API key is absent is silently skipped — no errors are raised.
+
+**Provider resilience:** if a configured provider is unreachable, a per-provider circuit breaker trips after a couple of connection failures and skips that provider's remaining agents immediately (a dead provider costs seconds, not minutes), the failure is printed rather than swallowed, and if **every** provider fails the run automatically falls back to the deterministic rule-based judge so you still get a full analysis.
+
+### Running with zero API keys (fully LLM-free)
+
+FinBot is designed to work completely without any LLM API. With no keys configured (or with `--no-llm`):
+- The **deterministic 4-lens rule-based judge** produces the recommendation, targets, entry/stop, and position size.
+- Headline **sentiment** is scored **offline by VADER** (finance-tuned lexicon) — no longer a neutral stub.
+- `sentiment_verdict`, `macro_verdict`, and `catalysts` are all derived from fetched data, so reports are complete.
+- The per-ticker + pooled **ML models** run entirely locally.
+
+Two commands make the LLM-free path stronger and measurable:
+
+```bash
+# Build a broad training universe (~110 liquid stocks) and retrain the pooled
+# global model on it — the biggest ML accuracy lever. One-off, slow, resumable.
+python main.py --build-universe
+
+# Paper-trading scoreboard: did following BUY calls beat holding SPY?
+# (Run --resolve first to settle matured predictions.)
+python main.py --portfolio --horizon 1m
+python main.py --portfolio --provider rule_based   # LLM-free calls only
+```
 
 > **No API key?** Just run with `--no-llm`. The rule-based judge produces a full report with no external calls.
 
@@ -470,7 +498,7 @@ Monte Carlo drift (μ) blends 60% CAPM-implied return (Rf + β × ERP) and 40% h
 
 ### Step 6 — ML Predictions (`ml/trainer.py`, `ml/predictor.py`)
 
-Two model families trained per ticker on **33 features** (returns, MA ratios, oscillators, volume, sentiment, VIX macro context, earnings proximity, and price z-score). Each horizon (5-day and 21-day) has a **GradientBoosting + RandomForest ensemble** — their `predict_proba` outputs are averaged for more stable predictions. Produces directional probability, calibrated probability (once feedback data accumulates), confidence label (HIGH/MEDIUM/LOW), and expected return %. Chronological 80/20 split; models cached under `models/{TICKER}/` and auto-retrained when either (a) models are older than 7 days, or (b) `FEATURE_COLS` has changed since the last training run (e.g. after a code upgrade adding new features).
+Two model families trained per ticker on the engineered feature set (returns, MA ratios, oscillators, volume, relative strength vs SPY, gaps, VIX macro context, earnings proximity, price z-score, and — for US filers — **SEC EDGAR point-in-time fundamentals**: revenue/net-income YoY growth, revenue acceleration, and operating/net margins, each joined on its SEC filing date so it is leak-free). Each horizon (5-day and 21-day) has a **GradientBoosting + RandomForest ensemble** — their `predict_proba` outputs are averaged for more stable predictions. Produces directional probability, calibrated probability (once feedback data accumulates), confidence label (HIGH/MEDIUM/LOW), and expected return %. Chronological 80/20 split; models cached under `models/{TICKER}/` and auto-retrained when either (a) models are older than 7 days, or (b) `FEATURE_COLS` has changed since the last training run (e.g. after a code upgrade adding new features).
 
 > **Note on `sentiment_score`:** this feature only carries real data on the **last row** (today's headlines, LLM-scored at run time). All historical rows default to `0.0` (NEUTRAL). The model therefore learns when sentiment is neutral, and detects deviations on the current prediction row.
 
