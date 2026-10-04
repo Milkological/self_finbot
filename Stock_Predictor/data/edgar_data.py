@@ -40,11 +40,14 @@ import time
 import pandas as pd
 import requests
 
+from config import SEC_EDGAR_CONTACT
+
 logger = logging.getLogger(__name__)
 
-# SEC asks for a real contact in the UA string (milkeoh@gmail.com is the
-# project owner). Do not remove — requests without it get 403s.
-_HEADERS = {"User-Agent": "FinBot research (milkeoh@gmail.com)"}
+# SEC asks for a real contact in the UA string — requests without it get 403s.
+# The contact comes from SEC_EDGAR_CONTACT in .env so it stays out of the repo.
+_HEADERS = {"User-Agent": f"FinBot research ({SEC_EDGAR_CONTACT})"}
+_warned_no_contact = [False]
 
 _CACHE_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "edgar"
@@ -102,6 +105,14 @@ def _get_json(url: str, cache_name: str, ttl_days: int) -> "dict | None":
         except Exception:
             pass
     try:
+        if not SEC_EDGAR_CONTACT:
+            if not _warned_no_contact[0]:
+                _warned_no_contact[0] = True
+                logger.warning(
+                    "SEC_EDGAR_CONTACT is not set in .env — skipping EDGAR "
+                    "fundamentals (SEC rejects requests without a contact)."
+                )
+            raise RuntimeError("SEC_EDGAR_CONTACT not set")
         _throttle()
         resp = requests.get(url, headers=_HEADERS, timeout=30)
         if resp.status_code != 200:

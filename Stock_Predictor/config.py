@@ -130,6 +130,13 @@ LLM_MAX_RETRIES: int   = int(os.getenv("LLM_MAX_RETRIES",   "0"))
 LLM_CIRCUIT_THRESHOLD: int = int(os.getenv("LLM_CIRCUIT_THRESHOLD", "2"))
 
 # ------------------------------------------------------------------
+# SEC EDGAR
+# ------------------------------------------------------------------
+# Contact email sent in the User-Agent of SEC EDGAR requests (SEC fair-access
+# policy). When empty, EDGAR fundamentals are skipped.
+SEC_EDGAR_CONTACT: str = os.getenv("SEC_EDGAR_CONTACT", "").strip()
+
+# ------------------------------------------------------------------
 # Feedback loop settings
 # ------------------------------------------------------------------
 # Directory where per-ticker feedback CSV files are stored.
