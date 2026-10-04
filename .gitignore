@@ -1,0 +1,11 @@
+# Repo-wide safety net — each project folder also has its own .gitignore.
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Secrets
+.env
+.env.*
+!.env.example
